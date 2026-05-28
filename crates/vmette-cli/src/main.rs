@@ -18,6 +18,8 @@ fn usage() -> ! {
            --initramfs        PATH      built by scripts/build-initramfs.sh\n\
          \n\
          workload:\n\
+           --image            REF       pull an OCI image (e.g. alpine:3.20) and use\n\
+                                        as the rootfs share. Mutex with --rootfs-share.\n\
            --rootfs-share     PATH      host dir mounted as guest /  (virtio-fs tag 'rootfs')\n\
            --ro-rootfs-share            mount rootfs share read-only\n\
            --share            TAG=PATH  extra virtio-fs mount at /mnt/<TAG> (repeatable)\n\
@@ -41,13 +43,19 @@ fn usage() -> ! {
     std::process::exit(2);
 }
 
-fn parse_args() -> Config {
+struct ParsedArgs {
+    config: Config,
+    image_ref: Option<String>,
+}
+
+fn parse_args() -> ParsedArgs {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let mut kernel: Option<PathBuf> = None;
     let mut initramfs: Option<PathBuf> = None;
     let mut cfg_cmdline: Option<String> = None;
     let mut rootfs_share: Option<PathBuf> = None;
     let mut rootfs_ro = false;
+    let mut image_ref: Option<String> = None;
     let mut shares: Vec<ShareMount> = Vec::new();
     let mut disks: Vec<PathBuf> = Vec::new();
     let mut exec_cmd: Option<String> = None;
@@ -74,6 +82,7 @@ fn parse_args() -> Config {
             "--cmdline"           => { cfg_cmdline = Some(take_next()); i += 2; }
             "--rootfs-share"      => { rootfs_share = Some(take_next().into()); i += 2; }
             "--ro-rootfs-share"   => { rootfs_ro = true; i += 1; }
+            "--image"             => { image_ref = Some(take_next()); i += 2; }
             "--share"             => {
                 let s = take_next();
                 let (tag, path) = s.split_once('=').unwrap_or_else(|| {
@@ -118,6 +127,10 @@ fn parse_args() -> Config {
         eprintln!("error: --resume-snapshot requires --exec");
         usage();
     }
+    if image_ref.is_some() && rootfs_share.is_some() {
+        eprintln!("error: --image and --rootfs-share are mutually exclusive");
+        usage();
+    }
 
     let mut c = Config::new(kernel, initramfs);
     if let Some(s) = cfg_cmdline { c.cmdline = s; }
@@ -136,11 +149,83 @@ fn parse_args() -> Config {
     c.mem_mib = mem_mib;
     c.build_snapshot = build_snapshot;
     c.resume_snapshot = resume_snapshot;
-    c
+    ParsedArgs { config: c, image_ref }
+}
+
+fn cache_root() -> PathBuf {
+    let home = std::env::var_os("HOME").unwrap_or_default();
+    PathBuf::from(home).join("Library/Caches/vmette/images")
+}
+
+fn guest_helpers_dir() -> Option<PathBuf> {
+    // Look for vsock-send / vsock-runner under common locations:
+    // 1. Next to the vmette binary (installed layout)
+    // 2. assets/alpine-rootfs/usr/local/bin (repo layout)
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.parent().map(|p| p.join("share/vmette/guest"));
+            if let Some(c) = candidate {
+                if c.join("vsock-send").exists() {
+                    return Some(c);
+                }
+            }
+        }
+    }
+    // Repo layout: cwd/assets/alpine-rootfs/usr/local/bin
+    let repo = std::env::current_dir()
+        .ok()?
+        .join("assets/alpine-rootfs/usr/local/bin");
+    if repo.join("vsock-send").exists() {
+        return Some(repo);
+    }
+    None
 }
 
 fn main() -> ExitCode {
-    let config = parse_args();
+    // Light tracing so vmette-image can log to stderr while pulling.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "vmette_image=info".into()),
+        )
+        .with_writer(std::io::stderr)
+        .without_time()
+        .with_target(false)
+        .try_init();
+
+    let parsed = parse_args();
+    let mut config = parsed.config;
+
+    // OCI image flow: pull + extract before handing off to vmette::run.
+    if let Some(image_ref) = parsed.image_ref {
+        let cache = cache_root();
+        let rt = match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt,
+            Err(e) => {
+                eprintln!("[vmette] tokio init: {}", e);
+                return ExitCode::from(1);
+            }
+        };
+        let rootfs = match rt.block_on(vmette_image::pull(&image_ref, &cache)) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[vmette] image pull failed: {}", e);
+                return ExitCode::from(1);
+            }
+        };
+        // Inject vmette guest helpers (vsock-send, vsock-runner) so vsock
+        // workflows work against any pulled image.
+        if let Some(src) = guest_helpers_dir() {
+            if let Err(e) = vmette_image::inject_guest_helpers(&rootfs, &src) {
+                eprintln!("[vmette] warning: helper inject: {}", e);
+            }
+        }
+        config.rootfs_share = Some(vmette::RootfsShare {
+            path: rootfs,
+            read_only: false,
+        });
+    }
+
     match vmette::run(&config) {
         Ok(out) => {
             // Note: vmette::run normally exits via the VM's stop delegate

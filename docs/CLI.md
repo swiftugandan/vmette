@@ -15,6 +15,7 @@ vmette --kernel PATH --initramfs PATH [options]
 
 | Flag | Argument | Description |
 |------|----------|-------------|
+| `--image` | REF | Pull an OCI/Docker image (e.g. `alpine:3.20`, `python:3.12-alpine`, `ghcr.io/org/img:tag`) and use as the rootfs. Cached by manifest digest at `~/Library/Caches/vmette/images/`. Anonymous auth only in v0.1. Mutually exclusive with `--rootfs-share`. |
 | `--rootfs-share` | PATH | Host directory mounted as guest `/` via virtio-fs (tag `rootfs`). |
 | `--ro-rootfs-share` | — | Mount the rootfs share read-only. Disables exit-code propagation (guest can't write `/.vmette-exit`). |
 | `--share` | TAG=PATH | Extra virtio-fs mount at `/mnt/<TAG>` in the guest. Repeatable. |
@@ -67,7 +68,14 @@ The guest's exec environment (passed via `/init`) sets:
 ## Examples
 
 ```sh
-# basic
+# pull a public OCI image and run a command in it
+vmette --kernel ./assets/vmlinuz-virt --initramfs ./assets/initramfs-vmette \
+       --image alpine:3.20 --exec 'cat /etc/alpine-release'
+
+# python ergonomics:
+vmette ... --image python:3.12-alpine --exec 'python3 -c "import sys; print(sys.version)"'
+
+# basic with a local rootfs
 vmette --kernel ./assets/vmlinuz-virt --initramfs ./assets/initramfs-vmette \
        --rootfs-share ./assets/alpine-rootfs --exec 'uname -a; exit 0'
 

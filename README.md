@@ -5,6 +5,8 @@ Local Linux microVM sandbox for macOS, built on Apple's
 dynamic library, and a long-lived daemon.
 
 - Boots a Linux guest in ~1 second
+- **Pulls OCI/Docker images directly** (`vmette --image alpine:3.20 …`)
+  with on-disk cache by manifest digest
 - virtio-fs for sharing host dirs, virtio-net (NAT), virtio-blk,
   vsock with bidirectional bytes
 - Exit-code propagation, timeout, switch-root, read-only rootfs share
@@ -31,12 +33,27 @@ make test               # cargo unit + end-to-end VM smoke
 
 ## Use it (CLI)
 
+Easiest path — pull an OCI image and run a command in it:
+
+```sh
+vmette --kernel ./assets/vmlinuz-virt --initramfs ./assets/initramfs-vmette \
+       --image python:3.12-alpine \
+       --exec 'python3 -c "print(2**32)"; exit 0'
+```
+
+First run pulls + extracts the image (alpine:3.20 ≈ 30 s); subsequent
+runs are cache hits (~3 s, mostly VM boot + manifest verification).
+Images are cached at `~/Library/Caches/vmette/images/`.
+
+Or supply your own rootfs directory:
+
 ```sh
 vmette --kernel ./assets/vmlinuz-virt --initramfs ./assets/initramfs-vmette \
        --rootfs-share ./assets/alpine-rootfs --exec 'uname -a; exit 0'
 ```
 
-Or via the bundled orchestrator script that auto-fetches assets on first run:
+The bundled orchestrator script auto-fetches assets on first run and
+uses the locally-built alpine rootfs:
 
 ```sh
 bash scripts/run.sh 'echo hello; exit 7'                     # → host exit 7

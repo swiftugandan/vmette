@@ -42,7 +42,7 @@ run() {
     shift  # drop --
     local cmd="$*"
 
-    printf "  %-30s " "$name"
+    printf "  %-40s " "$name"
     local log; log=$(mktemp)
     local got
     "$BIN" \
@@ -51,6 +51,35 @@ run() {
         --rootfs-share "$ROOTFS" \
         "${extra[@]+"${extra[@]}"}" \
         --exec         "$cmd" </dev/null >"$log" 2>&1
+    got=$?
+    if [[ "$got" == "$want" ]]; then
+        echo "PASS"
+        PASS=$((PASS + 1))
+    else
+        echo "FAIL  (expected exit $want, got $got)"
+        FAIL=$((FAIL + 1))
+        FAILED+=("$name")
+        echo "    --- log tail ---"
+        tail -5 "$log" | sed 's/^/    /'
+    fi
+    rm -f "$log"
+}
+
+# Variant that uses --image instead of --rootfs-share.
+run_image() {
+    local name="$1" want="$2" image="$3"; shift 3
+    while [[ "$1" != "--" ]]; do shift; done
+    shift
+    local cmd="$*"
+
+    printf "  %-40s " "$name"
+    local log; log=$(mktemp)
+    local got
+    "$BIN" \
+        --kernel    "$ASSETS/vmlinuz-virt" \
+        --initramfs "$ASSETS/initramfs-vmette" \
+        --image     "$image" \
+        --exec      "$cmd" </dev/null >"$log" 2>&1
     got=$?
     if [[ "$got" == "$want" ]]; then
         echo "PASS"
@@ -85,6 +114,9 @@ run "timeout exits 124" 124 --timeout 3 -- 'sleep 30'
 run "--vsock-port -1 unsets VMETTE_VSOCK_PORT" 0 --vsock-port -1 -- 'test -z "$VMETTE_VSOCK_PORT"'
 
 run "snapshot --build-snapshot arch guard" 1 --build-snapshot /tmp/foo.snap -- 'true'
+
+# --image: pulls from Docker Hub on first run (~30s), cached after (~3s).
+run_image "--image alpine:3.20 (network required)" 0 alpine:3.20 -- 'grep -q "^3.20" /etc/alpine-release'
 
 echo
 echo "=== summary: $PASS passed, $FAIL failed ==="

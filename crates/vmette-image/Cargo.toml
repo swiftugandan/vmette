@@ -1,0 +1,16 @@
+[package]
+name        = "vmette-image"
+description = "Pull OCI/Docker images and extract them as virtio-fs-ready rootfs trees for vmette"
+version     .workspace = true
+edition     .workspace = true
+license     .workspace = true
+repository  .workspace = true
+
+[dependencies]
+oci-client = { version = "0.17", default-features = false, features = ["rustls-tls"] }
+tokio      = { version = "1", features = ["fs", "io-util", "rt-multi-thread", "macros"] }
+tar        = "0.4"
+flate2     = "1"
+zstd       = "0.13"
+thiserror  = "1"
+tracing    = "0.1"

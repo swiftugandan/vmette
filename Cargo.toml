@@ -4,6 +4,7 @@ members = [
     "crates/vmette",
     "crates/vmette-cli",
     "crates/vmette-daemon",
+    "crates/vmette-image",
 ]
 
 [workspace.package]
