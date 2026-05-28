@@ -1,0 +1,19 @@
+[package]
+name        = "vmette-daemon"
+description = "Long-lived UNIX-socket daemon dispatching guests via vmette"
+version     .workspace = true
+edition     .workspace = true
+license     .workspace = true
+repository  .workspace = true
+
+[[bin]]
+name = "vmetted"
+path = "src/main.rs"
+
+[dependencies]
+tokio       = { version = "1", features = ["full"] }
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+tracing     = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+anyhow      = "1"
