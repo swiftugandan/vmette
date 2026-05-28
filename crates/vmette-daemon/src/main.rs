@@ -243,36 +243,46 @@ async fn handle(stream: UnixStream, vmette_bin: PathBuf) -> Result<()> {
     let mut out_done = false;
     let mut err_done = false;
 
+    // Helper closure: handle one read result. Flushes any accumulated
+    // partial line in `buf` on error before emitting the error frame,
+    // so diagnosis data isn't silently dropped.
+    async fn handle<W>(
+        n: std::io::Result<usize>,
+        buf: &mut String,
+        label: &'static str,
+        make_data: fn(String) -> Frame,
+        w: &mut W,
+    ) -> anyhow::Result<bool> /* returns true when stream is done */
+    where
+        W: AsyncWriteExt + Unpin,
+    {
+        match n {
+            Ok(0) => Ok(true),
+            Ok(_) => {
+                write_frame(w, &make_data(std::mem::take(buf))).await?;
+                Ok(false)
+            }
+            Err(e) => {
+                // Flush any unterminated partial line we already accumulated.
+                if !buf.is_empty() {
+                    let _ = write_frame(w, &make_data(std::mem::take(buf))).await;
+                }
+                let frame = Frame::Error { message: format!("{label}: {e}") };
+                let _ = write_frame(w, &frame).await;
+                Ok(true)
+            }
+        }
+    }
+
     while !out_done || !err_done {
         tokio::select! {
             n = out_reader.read_line(&mut out_buf), if !out_done => {
-                match n {
-                    Ok(0) => { out_done = true; }
-                    Ok(_) => {
-                        let frame = Frame::Stdout { data: std::mem::take(&mut out_buf) };
-                        write_frame(&mut write_half, &frame).await?;
-                    }
-                    Err(e) => {
-                        // Real I/O error — surface it instead of pretending EOF.
-                        let frame = Frame::Error { message: format!("stdout: {e}") };
-                        let _ = write_frame(&mut write_half, &frame).await;
-                        out_done = true;
-                    }
-                }
+                out_done = handle(n, &mut out_buf, "stdout",
+                    |data| Frame::Stdout { data }, &mut write_half).await?;
             }
             n = err_reader.read_line(&mut err_buf), if !err_done => {
-                match n {
-                    Ok(0) => { err_done = true; }
-                    Ok(_) => {
-                        let frame = Frame::Stderr { data: std::mem::take(&mut err_buf) };
-                        write_frame(&mut write_half, &frame).await?;
-                    }
-                    Err(e) => {
-                        let frame = Frame::Error { message: format!("stderr: {e}") };
-                        let _ = write_frame(&mut write_half, &frame).await;
-                        err_done = true;
-                    }
-                }
+                err_done = handle(n, &mut err_buf, "stderr",
+                    |data| Frame::Stderr { data }, &mut write_half).await?;
             }
         }
     }

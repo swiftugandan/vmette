@@ -154,7 +154,18 @@ run "snapshot --build-snapshot arch guard" 1 --build-snapshot /tmp/foo.snap -- '
 run_image "--image alpine:3.20 (network required)" 0 alpine:3.20 -- 'grep -q "^3.20" /etc/alpine-release'
 
 # --image-offline: assumes the alpine:3.20 cache is warm from the previous gate.
-run_image "--image-offline (cache hit)" 0 alpine:3.20 --image-offline -- 'true'
+# Age the ref-file mtime past the default 1h TTL so the test exercises
+# the offline branch, not the TTL fast-path (which would still serve
+# even without --image-offline).
+REF_FILE="$HOME/Library/Caches/vmette/images/refs/alpine_3.20.digest"
+if [[ -f "$REF_FILE" ]]; then
+    # 2 hours ago, well past default TTL of 1h.
+    touch -t "$(date -v-2H +%Y%m%d%H%M.%S)" "$REF_FILE" 2>/dev/null || true
+fi
+run_image "--image-offline (stale ref, hits offline)" 0 alpine:3.20 --image-offline -- 'true'
+
+# Also exercise the offline-cache-miss branch with an unknown image.
+run_image "--image-offline (unknown ref → fail)" 1 nosuchimage_vmette_test:v0 --image-offline -- 'true'
 
 # Parse-time rejection of impossible combo (switch-root + ro + exec → guest panic).
 # Expected: vmette exits 2 from the arg parser; never reaches the VM.

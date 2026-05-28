@@ -133,8 +133,15 @@ pub async fn pull_with_options(
         }
     }
 
-    // Offline + no usable cache → fail fast.
+    // Offline + no usable ref entry → scan disk for ANY extracted rootfs
+    // matching this image_ref. Salvages caches written by older binaries
+    // (which never created the refs/ entry) and partial state where the
+    // ref file was lost but the extracted tree survived.
     if options.offline {
+        if let Some(rootfs) = scan_offline_fallback(cache_root, image_ref) {
+            debug!(path = %rootfs.display(), "offline fallback: found cached rootfs without ref entry");
+            return Ok(rootfs);
+        }
         return Err(Error::OfflineCacheMiss(image_ref.into()));
     }
 
@@ -191,7 +198,12 @@ pub async fn pull_with_options(
         extract_layer(&layer.data, media, &rootfs)?;
     }
 
-    std::fs::write(&ready_marker, format!("{}\n", manifest_digest))?;
+    // Atomic marker write: stage to a temp file then rename, so a crash
+    // between writes can't leave a truncated marker that future runs
+    // mistake for a complete extraction.
+    let staging = rootfs.join(".vmette-image-ready.tmp");
+    std::fs::write(&staging, format!("{}\n", manifest_digest))?;
+    std::fs::rename(&staging, &ready_marker)?;
     write_ref_entry(&ref_file, &manifest_digest)?;
     info!(path = %rootfs.display(), "image ready");
     Ok(rootfs)
@@ -216,17 +228,60 @@ fn read_ref_entry(path: &Path) -> Option<(String, Duration)> {
     Some((digest, age))
 }
 
+/// Write the ref entry. If the file already contains the same digest,
+/// just bump mtime instead of rewriting bytes — keeps cache-hit
+/// reconfirmations metadata-only.
 fn write_ref_entry(path: &Path, digest: &str) -> Result<(), Error> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
+    }
+    if let Ok(existing) = std::fs::read_to_string(path) {
+        if existing.trim() == digest {
+            // Touch mtime without rewriting content. File::set_modified
+            // is stable since Rust 1.75.
+            if let Ok(f) = std::fs::OpenOptions::new().write(true).open(path) {
+                let _ = f.set_modified(SystemTime::now());
+                return Ok(());
+            }
+        }
     }
     std::fs::write(path, format!("{}\n", digest))?;
     Ok(())
 }
 
+/// Best-effort scan of `cache_root` for an extracted rootfs matching
+/// `image_ref` when no refs/<ref>.digest entry exists. Returns the
+/// most-recently-modified ready rootfs that matches the sanitized-
+/// ref prefix, or None if none found.
+fn scan_offline_fallback(cache_root: &Path, image_ref: &str) -> Option<PathBuf> {
+    let prefix = format!("{}__", sanitize_ref(image_ref));
+    let read = std::fs::read_dir(cache_root).ok()?;
+    let mut best: Option<(PathBuf, SystemTime)> = None;
+    for entry in read.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        let rootfs = entry.path().join("rootfs");
+        let marker = rootfs.join(".vmette-image-ready");
+        let Ok(meta) = std::fs::metadata(&marker) else { continue };
+        let Ok(mtime) = meta.modified() else { continue };
+        match best {
+            Some((_, ref ts)) if *ts >= mtime => {}
+            _ => best = Some((rootfs, mtime)),
+        }
+    }
+    best.map(|(p, _)| p)
+}
+
 /// Inject the contents of `src_bin_dir/{vsock-send,vsock-runner}` into
 /// the given rootfs at `/usr/local/bin/`. Used after [`pull`] so vmette
 /// guest helpers are available in any pulled image.
+///
+/// Idempotent: skips files that are already present with matching size,
+/// so warm cache hits don't pointlessly rewrite the shared cache (and
+/// don't pollute a `--ro-rootfs-share` user's expectations more than
+/// strictly necessary — the helpers stay, but no fresh writes happen).
 pub fn inject_guest_helpers(rootfs: &Path, src_bin_dir: &Path) -> Result<(), Error> {
     let target_dir = rootfs.join("usr/local/bin");
     std::fs::create_dir_all(&target_dir)?;
@@ -237,8 +292,15 @@ pub fn inject_guest_helpers(rootfs: &Path, src_bin_dir: &Path) -> Result<(), Err
             continue;
         }
         let dst = target_dir.join(name);
+        // Skip when dst exists and bytes-match src by size.
+        // Size+exists is a weak content check but cheap and good
+        // enough for fresh-built static binaries that don't drift.
+        if let (Ok(s_meta), Ok(d_meta)) = (std::fs::metadata(&src), std::fs::metadata(&dst)) {
+            if s_meta.len() == d_meta.len() && d_meta.permissions().readonly() == false {
+                continue;
+            }
+        }
         std::fs::copy(&src, &dst)?;
-        // chmod 755
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755))?;
     }

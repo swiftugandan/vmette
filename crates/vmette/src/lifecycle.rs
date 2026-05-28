@@ -118,7 +118,7 @@ pub fn run(config: &Config) -> Result<RunOutput, Error> {
                 unsafe { Retained::cast_unchecked(dev) };
             let logger = VsockLogger::new(ListenerState {
                 port,
-                ready_handler: Mutex::new(None),
+                ready_handler: Arc::new(Mutex::new(None)),
             });
             let listener = unsafe { VZVirtioSocketListener::new() };
             unsafe {

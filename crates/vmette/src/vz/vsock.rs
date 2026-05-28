@@ -4,7 +4,7 @@
 //! unblocks, and — for snapshot-build mode — fires a `ready_handler`
 //! block once when the guest writes the `READY\n` sentinel.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use dispatch2::{DispatchQoS, DispatchQueue, GlobalQueueIdentifier};
 use objc2::rc::Retained;
@@ -19,7 +19,12 @@ pub(crate) type ReadyHandler = Box<dyn FnOnce() + Send + 'static>;
 
 pub(crate) struct ListenerState {
     pub port: u32,
-    pub ready_handler: Mutex<Option<ReadyHandler>>,
+    /// Snapshot-build READY handler. Shared via Arc so connection
+    /// closures get clones; only the closure that actually observes
+    /// `READY\n` in its byte stream consumes the handler. A short-lived
+    /// probe connection that closes without sending READY no longer
+    /// loses the handler for the next, real connection.
+    pub ready_handler: Arc<Mutex<Option<ReadyHandler>>>,
 }
 
 define_class!(
@@ -47,23 +52,21 @@ define_class!(
             let port = self.ivars().port;
             eprintln!("\r\n[vsock] guest connected on port {} (fd={})\r", port, fd);
 
-            // Move the ready handler out (one-shot).
-            let ready_taken = self
-                .ivars()
-                .ready_handler
-                .lock()
-                .ok()
-                .and_then(|mut g| g.take());
+            // Clone the shared handler Arc; only consume from inside the
+            // read loop, and only when we actually observe `READY\n`. A
+            // connection that ends without READY does NOT drop the handler.
+            let ready_handler = Arc::clone(&self.ivars().ready_handler);
 
             let queue = DispatchQueue::global_queue(
                 GlobalQueueIdentifier::QualityOfService(DispatchQoS::Utility),
             );
             queue.exec_async(move || {
-                let mut ready = ready_taken;
                 // Sliding tail across reads so a READY split across two
-                // libc::read calls is still detected.
-                let needle = b"READY\n";
-                let mut prev_tail: Vec<u8> = Vec::with_capacity(needle.len() - 1);
+                // libc::read calls is still detected. Fixed-size stack
+                // buffer; no per-iteration allocation.
+                const NEEDLE: &[u8] = b"READY\n";
+                let mut tail: [u8; 5] = [0; 5]; // NEEDLE.len() - 1
+                let mut tail_len: usize = 0;
 
                 let mut buf = [0u8; 4096];
                 loop {
@@ -74,24 +77,26 @@ define_class!(
                     let slice = &buf[..n as usize];
 
                     // READY detection (one-shot, for snapshot build mode).
-                    // Only consume the handler if READY is actually seen —
-                    // arbitrary log bytes from the guest must NOT drop it.
-                    if ready.is_some() {
-                        let mut window: Vec<u8> = Vec::with_capacity(prev_tail.len() + slice.len());
-                        window.extend_from_slice(&prev_tail);
-                        window.extend_from_slice(slice);
-                        if memchr_seq(&window, needle) {
-                            if let Some(h) = ready.take() {
-                                DispatchQueue::main().exec_async(move || h());
-                            }
-                        } else {
-                            // Keep enough of the tail to catch a split needle next read.
-                            let keep = needle.len().saturating_sub(1);
-                            prev_tail.clear();
-                            let start = window.len().saturating_sub(keep);
-                            prev_tail.extend_from_slice(&window[start..]);
+                    // Two cheap passes: (1) scan a tiny carry+head window
+                    // for the boundary case, (2) scan slice itself. Either
+                    // hit consumes the handler from the shared Arc.
+                    let mut bridge = [0u8; 11]; // tail.len() + NEEDLE.len() - 1
+                    let take = (NEEDLE.len() - 1).min(slice.len());
+                    bridge[..tail_len].copy_from_slice(&tail[..tail_len]);
+                    bridge[tail_len..tail_len + take].copy_from_slice(&slice[..take]);
+                    let bridge_hit = memchr_seq(&bridge[..tail_len + take], NEEDLE);
+                    let slice_hit = memchr_seq(slice, NEEDLE);
+                    if bridge_hit || slice_hit {
+                        let h_opt = ready_handler.lock().ok().and_then(|mut g| g.take());
+                        if let Some(h) = h_opt {
+                            DispatchQueue::main().exec_async(move || h());
                         }
                     }
+                    // Carry forward at most NEEDLE.len()-1 bytes for the
+                    // next read's bridge.
+                    let keep = (NEEDLE.len() - 1).min(slice.len());
+                    tail_len = keep;
+                    tail[..keep].copy_from_slice(&slice[slice.len() - keep..]);
 
                     // Log to host stderr.
                     eprint!("[vsock {}] ", port);
