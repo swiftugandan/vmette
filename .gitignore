@@ -1,6 +1,7 @@
 /target
 /assets
 /vmette/vmette
+/examples/minimal_c
 *.sock
 *.log
 .DS_Store

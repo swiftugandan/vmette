@@ -6,6 +6,12 @@ edition     .workspace = true
 license     .workspace = true
 repository  .workspace = true
 
+# `lib`       — usable as a normal Rust crate dependency (used by vmette-cli + tests)
+# `cdylib`    — produces libvmette.dylib for non-Rust consumers
+# `staticlib` — produces libvmette.a for static linking
+[lib]
+crate-type = ["lib", "cdylib", "staticlib"]
+
 [dependencies]
 objc2                .workspace = true
 objc2-foundation     .workspace = true
@@ -17,3 +23,6 @@ thiserror            .workspace = true
 nix                  .workspace = true
 libc                 .workspace = true
 rand                 .workspace = true
+
+[build-dependencies]
+cbindgen = "0.27"

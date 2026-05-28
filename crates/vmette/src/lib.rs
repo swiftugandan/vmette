@@ -19,6 +19,8 @@ mod lifecycle;
 mod terminal;
 mod vz;
 
+pub mod ffi;
+
 pub use lifecycle::{run, RunOutput};
 
 /// Per-invocation host vsock port policy.
