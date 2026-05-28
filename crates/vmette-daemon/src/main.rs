@@ -248,22 +248,29 @@ async fn handle(stream: UnixStream, vmette_bin: PathBuf) -> Result<()> {
     // be lost when the future is dropped).
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Frame>(64);
 
+    // read_until + from_utf8_lossy tolerates non-UTF-8 bytes (binary
+    // output from xxd/tar/etc.) by replacing them with U+FFFD instead
+    // of erroring out. read_line would have killed the reader task on
+    // the first invalid sequence and silently truncated all subsequent
+    // guest output.
     let tx_out = tx.clone();
     let out_task = tokio::spawn(async move {
         let mut reader = BufReader::new(child_stdout);
-        let mut buf = String::new();
+        let mut buf: Vec<u8> = Vec::new();
         loop {
             buf.clear();
-            match reader.read_line(&mut buf).await {
+            match reader.read_until(b'\n', &mut buf).await {
                 Ok(0) => break,
                 Ok(_) => {
-                    if tx_out.send(Frame::Stdout { data: std::mem::take(&mut buf) }).await.is_err() {
+                    let data = String::from_utf8_lossy(&buf).into_owned();
+                    if tx_out.send(Frame::Stdout { data }).await.is_err() {
                         break;
                     }
                 }
                 Err(e) => {
                     if !buf.is_empty() {
-                        let _ = tx_out.send(Frame::Stdout { data: std::mem::take(&mut buf) }).await;
+                        let data = String::from_utf8_lossy(&buf).into_owned();
+                        let _ = tx_out.send(Frame::Stdout { data }).await;
                     }
                     let _ = tx_out.send(Frame::Error { message: format!("stdout: {e}") }).await;
                     break;
@@ -275,19 +282,21 @@ async fn handle(stream: UnixStream, vmette_bin: PathBuf) -> Result<()> {
     let tx_err = tx.clone();
     let err_task = tokio::spawn(async move {
         let mut reader = BufReader::new(child_stderr);
-        let mut buf = String::new();
+        let mut buf: Vec<u8> = Vec::new();
         loop {
             buf.clear();
-            match reader.read_line(&mut buf).await {
+            match reader.read_until(b'\n', &mut buf).await {
                 Ok(0) => break,
                 Ok(_) => {
-                    if tx_err.send(Frame::Stderr { data: std::mem::take(&mut buf) }).await.is_err() {
+                    let data = String::from_utf8_lossy(&buf).into_owned();
+                    if tx_err.send(Frame::Stderr { data }).await.is_err() {
                         break;
                     }
                 }
                 Err(e) => {
                     if !buf.is_empty() {
-                        let _ = tx_err.send(Frame::Stderr { data: std::mem::take(&mut buf) }).await;
+                        let data = String::from_utf8_lossy(&buf).into_owned();
+                        let _ = tx_err.send(Frame::Stderr { data }).await;
                     }
                     let _ = tx_err.send(Frame::Error { message: format!("stderr: {e}") }).await;
                     break;
