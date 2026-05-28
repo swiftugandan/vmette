@@ -292,12 +292,18 @@ pub fn inject_guest_helpers(rootfs: &Path, src_bin_dir: &Path) -> Result<(), Err
             continue;
         }
         let dst = target_dir.join(name);
-        // Skip when dst exists and bytes-match src by size.
-        // Size+exists is a weak content check but cheap and good
-        // enough for fresh-built static binaries that don't drift.
+        // Skip the copy only when dst is at least as new as src and
+        // sizes match. Size alone is unsound — a same-size rebuild
+        // (common for code-only diffs to stripped static binaries)
+        // would silently keep the stale binary. mtime-newer-than-src
+        // is the same heuristic make(1) uses.
         if let (Ok(s_meta), Ok(d_meta)) = (std::fs::metadata(&src), std::fs::metadata(&dst)) {
-            if s_meta.len() == d_meta.len() && d_meta.permissions().readonly() == false {
-                continue;
+            if s_meta.len() == d_meta.len() {
+                if let (Ok(s_mtime), Ok(d_mtime)) = (s_meta.modified(), d_meta.modified()) {
+                    if d_mtime >= s_mtime {
+                        continue;
+                    }
+                }
             }
         }
         std::fs::copy(&src, &dst)?;

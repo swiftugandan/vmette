@@ -93,10 +93,25 @@ define_class!(
                         }
                     }
                     // Carry forward at most NEEDLE.len()-1 bytes for the
-                    // next read's bridge.
-                    let keep = (NEEDLE.len() - 1).min(slice.len());
+                    // next read's bridge. The carry must be the suffix
+                    // of (tail + slice) combined — if slice is shorter
+                    // than the carry window, we'd otherwise drop prior
+                    // tail bytes and miss a needle split across 3+ reads.
+                    let combined_len = tail_len + slice.len();
+                    let keep = (NEEDLE.len() - 1).min(combined_len);
+                    let mut new_tail = [0u8; 5];
+                    // Source position into the conceptual `tail ++ slice` window.
+                    let src_start = combined_len - keep;
+                    for i in 0..keep {
+                        let src_pos = src_start + i;
+                        new_tail[i] = if src_pos < tail_len {
+                            tail[src_pos]
+                        } else {
+                            slice[src_pos - tail_len]
+                        };
+                    }
+                    tail = new_tail;
                     tail_len = keep;
-                    tail[..keep].copy_from_slice(&slice[slice.len() - keep..]);
 
                     // Log to host stderr.
                     eprint!("[vsock {}] ", port);
