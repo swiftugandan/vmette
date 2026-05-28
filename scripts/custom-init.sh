@@ -1,0 +1,271 @@
+#!/bin/sh
+# vz-spike custom /init (PID 1 inside the alpine initramfs).
+#
+# Runs as PID 1. Two things make this script unusual:
+#
+#   1. Alpine's initramfs ships /bin/busybox and a tree of hardlinks
+#      (/bin/mkdir → busybox, etc.). bsdcpio on macOS does not preserve those
+#      hardlinks across an extract+repack, so the first thing we do is
+#      symlink every applet we need back into /bin and /sbin.
+#
+#   2. /proc isn't mounted yet, so we can't `cat /proc/cmdline` to learn
+#      anything. We mount the bare minimum first, then parse the cmdline
+#      using only shell builtins (no awk, no grep) so we're not dependent
+#      on any applet beyond what the bootstrap creates.
+
+# ---- step 0: bootstrap busybox applet symlinks --------------------------
+
+BB=/bin/busybox
+if [ ! -x "$BB" ]; then
+    echo "[init] FATAL: /bin/busybox missing" >&2
+    while :; do "$BB" sleep 60 2>/dev/null || break; done
+    exit 1
+fi
+
+$BB mkdir -p /bin /sbin /proc /sys /dev /tmp /newroot
+
+for a in awk base64 basename cat chmod chroot cp dmesg echo find grep head \
+         ifconfig ip ln ls mkdir mknod modprobe mount mv poweroff printf rm \
+         route sed sleep switch_root sync tr udhcpc umount; do
+    [ -e "/bin/$a" ]  || $BB ln -sf busybox "/bin/$a"  2>/dev/null
+    [ -e "/sbin/$a" ] || $BB ln -sf busybox "/sbin/$a" 2>/dev/null
+done
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+log() { echo "[init] $*" >&2; }
+
+# ---- step 1: mount baseline pseudo-filesystems --------------------------
+
+mount -t proc     proc     /proc     2>/dev/null
+mount -t sysfs    sysfs    /sys      2>/dev/null
+mount -t devtmpfs devtmpfs /dev      2>/dev/null
+
+# Regenerate modules.dep so modprobe can resolve dependencies. The apk we
+# pulled doesn't ship a pre-built modules.dep that matches the layout we
+# repacked; busybox depmod is sufficient.
+depmod -a 2>/dev/null || true
+
+for m in virtio virtio_ring virtio_pci virtio_console virtio_blk virtio_net \
+         fuse virtiofs \
+         vsock vmw_vsock_virtio_transport_common vmw_vsock_virtio_transport; do
+    modprobe "$m" 2>/dev/null
+done
+
+# ---- step 2: cmdline parsing in pure shell ------------------------------
+
+read CMDLINE < /proc/cmdline
+
+cmdline_get() {
+    _key="$1"
+    for _tok in $CMDLINE; do
+        case "$_tok" in
+            "$_key="*) echo "${_tok#${_key}=}"; return ;;
+        esac
+    done
+}
+
+cmdline_all() {
+    _key="$1"
+    for _tok in $CMDLINE; do
+        case "$_tok" in
+            "$_key="*) echo "${_tok#${_key}=}" ;;
+        esac
+    done
+}
+
+# Pull out the flags we care about up front.
+ROOTFS_RO="$(cmdline_get spike.rootfs_ro)"
+USE_SWITCH_ROOT="$(cmdline_get spike.switch_root)"
+SPIKE_NET="$(cmdline_get spike.net)"
+SPIKE_VSOCK_PORT="$(cmdline_get spike.vsock_port)"
+SPIKE_SNAPSHOT_MODE="$(cmdline_get spike.snapshot_mode)"
+SPIKE_GUEST_VSOCK_PORT="$(cmdline_get spike.guest_vsock_port)"
+export SPIKE_VSOCK_PORT SPIKE_GUEST_VSOCK_PORT
+
+# ---- step 3: mount rootfs share -----------------------------------------
+
+if [ "$(cmdline_get spike.rootfs)" = "1" ]; then
+    if [ "$ROOTFS_RO" = "1" ]; then
+        mount_opts="-o ro"
+    else
+        mount_opts=""
+    fi
+    # shellcheck disable=SC2086
+    if mount -t virtiofs $mount_opts rootfs /newroot 2>/dev/null; then
+        log "mounted virtio-fs 'rootfs' at /newroot${ROOTFS_RO:+ (ro)}"
+    else
+        log "FATAL: could not mount virtio-fs tag 'rootfs'; dropping to shell"
+        exec /bin/sh
+    fi
+else
+    log "no rootfs share; running in initramfs (limited environment)"
+    cp -a /bin /sbin /usr /etc /lib /newroot/ 2>/dev/null
+fi
+
+# ---- step 3b: networking (when --net is set) ----------------------------
+# Bring up the first non-lo interface via DHCP. NAT'd by VZ so we get a
+# 192.168.x.x address. udhcpc takes 1-2 s — only run when asked.
+if [ "$SPIKE_NET" = "1" ]; then
+    # Write our own udhcpc script; busybox udhcpc requires one and we
+    # can't rely on alpine's being present in the initramfs.
+    cat > /tmp/udhcpc.sh <<'UDHCPC_EOF'
+#!/bin/sh
+[ -z "$1" ] && exit 1
+case "$1" in
+    deconfig)
+        ip addr flush dev "$interface" 2>/dev/null
+        ;;
+    bound|renew)
+        ip addr add "$ip/${mask:-24}" dev "$interface" 2>/dev/null
+        ip link set "$interface" up 2>/dev/null
+        [ -n "$router" ] && ip route add default via "$router" 2>/dev/null
+        : > /etc/resolv.conf
+        [ -n "$domain" ] && echo "search $domain" >> /etc/resolv.conf
+        for n in $dns; do echo "nameserver $n" >> /etc/resolv.conf; done
+        ;;
+esac
+exit 0
+UDHCPC_EOF
+    chmod +x /tmp/udhcpc.sh
+
+    IFACE=""
+    for i in /sys/class/net/*; do
+        name="${i##*/}"
+        [ "$name" = "lo" ] && continue
+        IFACE="$name"; break
+    done
+
+    if [ -n "$IFACE" ]; then
+        ip link set "$IFACE" up 2>/dev/null
+        if udhcpc -i "$IFACE" -q -t 3 -n -s /tmp/udhcpc.sh 2>/tmp/udhcpc.err; then
+            IPADDR="$(ip -4 addr show "$IFACE" 2>/dev/null | awk '/inet /{print $2; exit}')"
+            log "network up on $IFACE ($IPADDR)"
+            # Propagate resolv.conf into the chroot/switch_root target.
+            if [ -f /etc/resolv.conf ] && [ -d /newroot/etc ]; then
+                cp /etc/resolv.conf /newroot/etc/resolv.conf 2>/dev/null
+            fi
+        else
+            log "WARNING: udhcpc on $IFACE failed: $(cat /tmp/udhcpc.err 2>/dev/null)"
+        fi
+    else
+        log "WARNING: --net set but no non-lo interface found"
+    fi
+fi
+
+# ---- step 4: mount additional virtio-fs shares --------------------------
+
+mkdir -p /newroot/mnt
+for tag in $(cmdline_all spike.share); do
+    mkdir -p "/newroot/mnt/$tag"
+    if mount -t virtiofs "$tag" "/newroot/mnt/$tag" 2>/dev/null; then
+        log "mounted virtio-fs '$tag' at /mnt/$tag"
+    else
+        log "warning: failed to mount virtio-fs '$tag'"
+    fi
+done
+
+# ---- step 5: prepare /proc /sys /dev for chroot or switch_root ---------
+
+mkdir -p /newroot/tmp
+mount -t tmpfs tmpfs /newroot/tmp 2>/dev/null
+
+if [ "$USE_SWITCH_ROOT" = "1" ]; then
+    # Move (not bind) the pseudo-fs into the new root so they follow us.
+    for d in proc sys dev; do
+        mkdir -p "/newroot/$d"
+        mount --move "/$d" "/newroot/$d" 2>/dev/null
+    done
+else
+    # chroot path: bind-mount so both /init and the chroot see them.
+    for d in proc sys dev; do
+        mkdir -p "/newroot/$d"
+        mount --bind "/$d" "/newroot/$d" 2>/dev/null
+    done
+fi
+
+# ---- step 6: run the workload -------------------------------------------
+
+# Snapshot build mode: chroot in, exec vsock-runner which signals READY to
+# the host then blocks on accept() for a command. The host pauses + saves
+# the VM at the accept() blocker; on resume, vsock-runner reads the new
+# command, runs it, streams output back, reboots.
+if [ "$SPIKE_SNAPSHOT_MODE" = "server" ]; then
+    if [ -z "$SPIKE_VSOCK_PORT" ] || [ -z "$SPIKE_GUEST_VSOCK_PORT" ]; then
+        log "FATAL: snapshot_mode=server but vsock ports not set"
+        sync; poweroff -f; sleep 60
+    fi
+    log "snapshot mode: exec vsock-runner $SPIKE_VSOCK_PORT $SPIKE_GUEST_VSOCK_PORT"
+    if [ "$USE_SWITCH_ROOT" = "1" ]; then
+        # Reuse the switch_root machinery (already moved /proc /sys /dev).
+        exec switch_root /newroot /usr/local/bin/vsock-runner "$SPIKE_VSOCK_PORT" "$SPIKE_GUEST_VSOCK_PORT"
+    fi
+    exec chroot /newroot /usr/local/bin/vsock-runner "$SPIKE_VSOCK_PORT" "$SPIKE_GUEST_VSOCK_PORT"
+fi
+
+B64="$(cmdline_get spike.exec)"
+
+# Decode the user command (if any).
+if [ -n "$B64" ]; then
+    USER_CMD="$(printf '%s' "$B64" | base64 -d 2>/dev/null)"
+    if [ -z "$USER_CMD" ]; then
+        log "FATAL: spike.exec base64 decode failed"
+        sync; poweroff -f; sleep 60
+    fi
+fi
+
+# Decide where the exit file lives (skip under RO).
+EXIT_FILE=""
+if [ -z "$ROOTFS_RO" ] || [ "$ROOTFS_RO" != "1" ]; then
+    EXIT_FILE="/.vz-spike-exit"
+fi
+
+if [ "$USE_SWITCH_ROOT" = "1" ]; then
+    if [ "$ROOTFS_RO" = "1" ]; then
+        log "WARNING: --switch-root with read-only rootfs — exit code won't propagate"
+    fi
+    # Write a wrapper script into the rootfs share so the new init has
+    # something to exec. When the rootfs is RO this fails silently and
+    # the user just gets an interactive shell.
+    RUNNER="/newroot/.vz-spike-runner.sh"
+    if [ -n "$USER_CMD" ]; then
+        cat > "$RUNNER" 2>/dev/null <<RUNNER_EOF
+#!/bin/sh
+export SPIKE_VSOCK_PORT='$SPIKE_VSOCK_PORT'
+/bin/sh -c '$(printf '%s' "$USER_CMD" | sed "s/'/'\\\\''/g")'
+RC=\$?
+sync
+${EXIT_FILE:+echo "\$RC" > "$EXIT_FILE" 2>/dev/null}
+poweroff -f
+sleep 60
+RUNNER_EOF
+        chmod +x "$RUNNER" 2>/dev/null
+        log "switch_root → /.vz-spike-runner.sh"
+        exec switch_root /newroot /.vz-spike-runner.sh
+    fi
+    # No --exec: drop to interactive shell. User can type poweroff -f.
+    log "switch_root → interactive shell"
+    exec switch_root /newroot /bin/sh
+fi
+
+# ---- chroot path (default) ----------------------------------------------
+
+if [ -z "$B64" ]; then
+    log "no spike.exec; dropping to interactive shell in chroot"
+    chroot /newroot /bin/sh
+    RC=$?
+else
+    log "exec: $USER_CMD"
+    chroot /newroot /bin/sh -c "$USER_CMD"
+    RC=$?
+    log "exit=$RC"
+fi
+
+sync
+if [ -n "$EXIT_FILE" ]; then
+    echo "$RC" > "/newroot$EXIT_FILE" 2>/dev/null
+fi
+poweroff -f
+
+# Block forever — poweroff returns; we can't fall off PID 1.
+while :; do sleep 60; done

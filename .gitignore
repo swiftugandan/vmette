@@ -1,0 +1,9 @@
+/target
+/assets
+/vz-spike/vz-spike
+*.sock
+*.log
+.DS_Store
+.vz-spike-exit
+.vz-spike-runner.sh
+/tests/fixtures/share/from-guest*
