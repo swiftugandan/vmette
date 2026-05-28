@@ -240,62 +240,86 @@ async fn handle(stream: UnixStream, vmette_bin: PathBuf) -> Result<()> {
     let child_stdout = child.stdout.take().unwrap();
     let child_stderr = child.stderr.take().unwrap();
 
-    // Stream stdout + stderr concurrently as JSON frames.
-    let mut out_reader = BufReader::new(child_stdout);
-    let mut err_reader = BufReader::new(child_stderr);
-    let mut out_buf = String::new();
-    let mut err_buf = String::new();
-    let mut out_done = false;
-    let mut err_done = false;
+    // Spawn one task per stream so each `read_line` runs to completion
+    // and owns its BufReader. Frames flow to a single mpsc channel and
+    // the main task forwards them to the socket. Avoids tokio::select!
+    // cancelling read_line mid-call — AsyncBufReadExt::read_line is
+    // documented NOT cancel-safe (bytes already in the BufReader can
+    // be lost when the future is dropped).
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Frame>(64);
 
-    // Helper closure: handle one read result. Flushes any accumulated
-    // partial line in `buf` on error before emitting the error frame,
-    // so diagnosis data isn't silently dropped.
-    async fn handle<W>(
-        n: std::io::Result<usize>,
-        buf: &mut String,
-        label: &'static str,
-        make_data: fn(String) -> Frame,
-        w: &mut W,
-    ) -> anyhow::Result<bool> /* returns true when stream is done */
-    where
-        W: AsyncWriteExt + Unpin,
-    {
-        match n {
-            Ok(0) => Ok(true),
-            Ok(_) => {
-                write_frame(w, &make_data(std::mem::take(buf))).await?;
-                Ok(false)
-            }
-            Err(e) => {
-                // Flush any unterminated partial line we already accumulated.
-                if !buf.is_empty() {
-                    let _ = write_frame(w, &make_data(std::mem::take(buf))).await;
+    let tx_out = tx.clone();
+    let out_task = tokio::spawn(async move {
+        let mut reader = BufReader::new(child_stdout);
+        let mut buf = String::new();
+        loop {
+            buf.clear();
+            match reader.read_line(&mut buf).await {
+                Ok(0) => break,
+                Ok(_) => {
+                    if tx_out.send(Frame::Stdout { data: std::mem::take(&mut buf) }).await.is_err() {
+                        break;
+                    }
                 }
-                let frame = Frame::Error { message: format!("{label}: {e}") };
-                let _ = write_frame(w, &frame).await;
-                Ok(true)
+                Err(e) => {
+                    if !buf.is_empty() {
+                        let _ = tx_out.send(Frame::Stdout { data: std::mem::take(&mut buf) }).await;
+                    }
+                    let _ = tx_out.send(Frame::Error { message: format!("stdout: {e}") }).await;
+                    break;
+                }
             }
         }
-    }
+    });
 
-    while !out_done || !err_done {
-        tokio::select! {
-            n = out_reader.read_line(&mut out_buf), if !out_done => {
-                out_done = handle(n, &mut out_buf, "stdout",
-                    |data| Frame::Stdout { data }, &mut write_half).await?;
-            }
-            n = err_reader.read_line(&mut err_buf), if !err_done => {
-                err_done = handle(n, &mut err_buf, "stderr",
-                    |data| Frame::Stderr { data }, &mut write_half).await?;
+    let tx_err = tx.clone();
+    let err_task = tokio::spawn(async move {
+        let mut reader = BufReader::new(child_stderr);
+        let mut buf = String::new();
+        loop {
+            buf.clear();
+            match reader.read_line(&mut buf).await {
+                Ok(0) => break,
+                Ok(_) => {
+                    if tx_err.send(Frame::Stderr { data: std::mem::take(&mut buf) }).await.is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    if !buf.is_empty() {
+                        let _ = tx_err.send(Frame::Stderr { data: std::mem::take(&mut buf) }).await;
+                    }
+                    let _ = tx_err.send(Frame::Error { message: format!("stderr: {e}") }).await;
+                    break;
+                }
             }
         }
-    }
+    });
 
-    let status = child.wait().await?;
-    let code = status.code().unwrap_or(-1);
-    write_frame(&mut write_half, &Frame::Exit { code }).await?;
-    write_half.shutdown().await?;
+    // Drop our copy so the channel closes once both reader tasks finish.
+    drop(tx);
+
+    // Forward frames until both reader tasks finish (channel closes).
+    while let Some(frame) = rx.recv().await {
+        if write_frame(&mut write_half, &frame).await.is_err() {
+            // Client gone — abandon the stream. kill_on_drop will tear
+            // down the subprocess when this handler returns.
+            return Ok(());
+        }
+    }
+    let _ = out_task.await;
+    let _ = err_task.await;
+
+    // Always emit a terminal frame so the client can stop reading.
+    // child.wait() errors get surfaced as Frame::Error rather than
+    // swallowed via ?-propagation, which would leave the client
+    // hanging on a socket with no exit marker.
+    let exit_frame = match child.wait().await {
+        Ok(status) => Frame::Exit { code: status.code().unwrap_or(-1) },
+        Err(e) => Frame::Error { message: format!("wait: {e}") },
+    };
+    let _ = write_frame(&mut write_half, &exit_frame).await;
+    let _ = write_half.shutdown().await;
     Ok(())
 }
 
