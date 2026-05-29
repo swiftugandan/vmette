@@ -169,6 +169,26 @@ Output:
 
 See [`docs/DAEMON.md`](docs/DAEMON.md).
 
+## Use it (AI agents via MCP)
+
+```jsonc
+// ~/Library/Application Support/Claude/claude_desktop_config.json
+{ "mcpServers": {
+    "vmette": {
+      "command": "vmette-mcp",
+      "args": ["--default-image", "python:3.12-alpine", "--allow-network"]
+}}}
+```
+
+`vmette-mcp` is a Model Context Protocol server that exposes seven
+tools (`execute`, `fetch_url`, plus a `workspace_*` family) to any
+MCP-aware agent host — Claude Desktop, Cursor, Cline, Zed, Goose, etc.
+Each tool call boots a fresh microVM; the agent never touches your
+real filesystem unless you explicitly shared a directory into it.
+
+See [`docs/MCP.md`](docs/MCP.md) for the full tool reference, security
+model, and client configs.
+
 ## How it works
 
 1. `vmette` builds a `VZVirtualMachineConfiguration` (kernel, initramfs,
@@ -204,6 +224,7 @@ crates/
   vmette-provider-tar/   Tarball provider (tar+https://, tar+file://)
   vmette-cli/            `vmette` CLI binary (registers dir/tar/oci providers)
   vmette-daemon/         `vmetted` UNIX-socket dispatcher (tokio + JSON)
+  vmette-mcp/            `vmette-mcp` Model Context Protocol server for AI agents
 guest/                   C sources cross-compiled for the Linux guest
   vsock-send.c           pipe stdin → AF_VSOCK → host listener
   vsock-runner.c         snapshot-mode cmd server
@@ -246,6 +267,7 @@ Makefile                 help | build | universal | dist | test | run | shell | 
 - [`docs/CLI.md`](docs/CLI.md) — full flag reference
 - [`docs/API.md`](docs/API.md) — Rust + C library API
 - [`docs/DAEMON.md`](docs/DAEMON.md) — vmetted protocol spec
+- [`docs/MCP.md`](docs/MCP.md) — vmette-mcp server tool reference + client configs
 - [`docs/HACKING.md`](docs/HACKING.md) — build, test, debug
 - [`CHANGELOG.md`](CHANGELOG.md) — release notes
 

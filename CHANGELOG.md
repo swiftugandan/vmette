@@ -42,6 +42,12 @@ Apple's `Virtualization.framework`.
   per request. Request schema uses `rootfs` (string) +
   `rootfs_ro` / `offline` flags. Structured JSON logs via
   tracing-subscriber.
+- **MCP server** (`vmette-mcp`): Model Context Protocol server using
+  `rmcp` 1.7. Exposes seven tools (`execute`, `fetch_url`, plus a
+  `workspace_*` family) over stdio. Plugs into Claude Desktop, Cursor,
+  Cline, Zed, and any other MCP-aware host. Per-session workspace
+  state with a cap; `--allow-network` gate; `O_NOFOLLOW`-and-symlink-
+  walk path safety in `workspace_read`/`workspace_write`.
 - **Guest tooling**: custom `/init` (busybox-applet bootstrap, virtio
   module load, virtiofs mounts, NAT DHCP, chroot/switch_root, exit
   code propagation), `vsock-send` (AF_VSOCK client, ~25 KB static

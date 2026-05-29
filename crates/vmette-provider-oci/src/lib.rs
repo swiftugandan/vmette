@@ -5,9 +5,8 @@
 //!
 //! * `oci://<ref>` — explicit scheme, never ambiguous
 //! * `<ref>`       — bare image references (e.g. `alpine:3.20`,
-//!                    `ghcr.io/foo/bar:tag`). The OCI provider is the
-//!                    catch-all fallback once path-style and other-scheme
-//!                    providers have declined.
+//!   `ghcr.io/foo/bar:tag`). The OCI provider is the catch-all
+//!   fallback once path-style and other-scheme providers have declined.
 //!
 //! Pulls the manifest + layers, extracts in order applying OCI whiteouts,
 //! caches by manifest digest, and (when [`Context::guest_helpers`] is
@@ -96,9 +95,7 @@ impl From<Error> for ProviderError {
     fn from(e: Error) -> Self {
         match e {
             Error::OfflineCacheMiss(s) => ProviderError::OfflineCacheMiss(s),
-            Error::InvalidReference(r, msg) => {
-                ProviderError::InvalidSpec(format!("{r}: {msg}"))
-            }
+            Error::InvalidReference(r, msg) => ProviderError::InvalidSpec(format!("{r}: {msg}")),
             Error::Io(io) => ProviderError::Io(io),
             other => ProviderError::Other(other.to_string()),
         }
@@ -126,7 +123,9 @@ impl OciProvider {
     /// call, so a single provider instance serves both online and offline
     /// resolutions.
     pub fn new() -> Self {
-        Self { options: PullOptions::default() }
+        Self {
+            options: PullOptions::default(),
+        }
     }
 
     /// Construct with custom pull options. `options.offline` is treated
@@ -177,9 +176,7 @@ impl RootfsProvider for OciProvider {
     fn provide(&self, spec: &str, ctx: &Context) -> Result<PathBuf, ProviderError> {
         let image_ref = spec.strip_prefix("oci://").unwrap_or(spec);
         if image_ref.is_empty() {
-            return Err(ProviderError::InvalidSpec(
-                "empty image reference".into(),
-            ));
+            return Err(ProviderError::InvalidSpec("empty image reference".into()));
         }
         let cache = ctx.provider_cache(self.name())?;
 
@@ -191,9 +188,8 @@ impl RootfsProvider for OciProvider {
         // Note: the tokio runtime is built lazily INSIDE pull_with_options
         // — only when a network roundtrip is actually needed. Cache hits
         // resolve via blocking fs::metadata and pay no runtime cost.
-        let rootfs = pull_with_options_sync(image_ref, &cache, &opts).map_err(|e| {
-            map_oci_error(spec, image_ref, e)
-        })?;
+        let rootfs = pull_with_options_sync(image_ref, &cache, &opts)
+            .map_err(|e| map_oci_error(spec, image_ref, e))?;
 
         if let Some(src) = ctx.guest_helpers() {
             if let Err(e) = inject_guest_helpers(&rootfs, src) {
@@ -224,7 +220,9 @@ fn map_oci_error(spec: &str, image_ref: &str, e: Error) -> ProviderError {
                 .map(|first| !first.contains('.'))
                 .unwrap_or(false);
         let exists_on_disk = shape_pathlike
-            && std::fs::metadata(image_ref).map(|m| m.is_dir()).unwrap_or(false);
+            && std::fs::metadata(image_ref)
+                .map(|m| m.is_dir())
+                .unwrap_or(false);
         if exists_on_disk {
             // "may be" leaves room for the rare case where a workspace
             // coincidentally contains a directory at the same relative
@@ -270,7 +268,7 @@ fn pull_with_options_sync(
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("tokio init: {e}"))))?;
+        .map_err(|e| Error::Io(std::io::Error::other(format!("tokio init: {e}"))))?;
     rt.block_on(pull_with_options(image_ref, cache_root, options))
 }
 
@@ -278,11 +276,7 @@ fn pull_with_options_sync(
 /// Returns Some(rootfs) iff a within-TTL (or offline) ready marker is
 /// present on disk; otherwise None (caller must consult the network
 /// or the offline-fallback scanner).
-fn fast_path_lookup(
-    cache_root: &Path,
-    image_ref: &str,
-    options: &PullOptions,
-) -> Option<PathBuf> {
+fn fast_path_lookup(cache_root: &Path, image_ref: &str, options: &PullOptions) -> Option<PathBuf> {
     let ref_file = cache_root
         .join("refs")
         .join(format!("{}.digest", sanitize_ref(image_ref)));
@@ -292,11 +286,7 @@ fn fast_path_lookup(
     if !marker.exists() {
         return None;
     }
-    let fresh_enough = options.offline
-        || options
-            .cache_ttl
-            .map(|ttl| age <= ttl)
-            .unwrap_or(false);
+    let fresh_enough = options.offline || options.cache_ttl.map(|ttl| age <= ttl).unwrap_or(false);
     if fresh_enough {
         debug!(
             path = %rootfs.display(),
@@ -336,9 +326,9 @@ pub async fn pull_with_options(
         return Ok(rootfs);
     }
 
-    let reference: Reference = image_ref
-        .parse()
-        .map_err(|e: oci_client::ParseError| Error::InvalidReference(image_ref.into(), e.to_string()))?;
+    let reference: Reference = image_ref.parse().map_err(|e: oci_client::ParseError| {
+        Error::InvalidReference(image_ref.into(), e.to_string())
+    })?;
 
     let refs_dir = cache_root.join("refs");
     let ref_file = refs_dir.join(format!("{}.digest", sanitize_ref(image_ref)));
@@ -381,9 +371,7 @@ pub async fn pull_with_options(
 
     info!(digest = %manifest_digest, "cache miss; pulling layers");
 
-    let image: ImageData = client
-        .pull(&reference, &auth, MEDIA_TYPES.to_vec())
-        .await?;
+    let image: ImageData = client.pull(&reference, &auth, MEDIA_TYPES.to_vec()).await?;
 
     info!(
         path = %rootfs.display(),
@@ -421,7 +409,11 @@ pub async fn pull_with_options(
 
 fn extracted_path(cache_root: &Path, image_ref: &str, digest: &str) -> PathBuf {
     cache_root
-        .join(format!("{}__{}", sanitize_ref(image_ref), digest_to_dir(digest)))
+        .join(format!(
+            "{}__{}",
+            sanitize_ref(image_ref),
+            digest_to_dir(digest)
+        ))
         .join("rootfs")
 }
 
@@ -474,7 +466,9 @@ fn scan_offline_fallback(cache_root: &Path, image_ref: &str) -> Option<PathBuf> 
         }
         let rootfs = entry.path().join("rootfs");
         let marker = rootfs.join(".vmette-image-ready");
-        let Ok(meta) = std::fs::metadata(&marker) else { continue };
+        let Ok(meta) = std::fs::metadata(&marker) else {
+            continue;
+        };
         let Ok(mtime) = meta.modified() else { continue };
         match best {
             Some((_, ref ts)) if *ts >= mtime => {}
@@ -489,7 +483,13 @@ fn scan_offline_fallback(cache_root: &Path, image_ref: &str) -> Option<PathBuf> 
 fn sanitize_ref(image_ref: &str) -> String {
     image_ref
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -503,7 +503,11 @@ fn digest_to_dir(digest: &str) -> String {
     if cleaned.len() > 24 {
         // Keep prefix + first 16 hex of digest for human readability.
         let prefix_end = cleaned.find('-').map(|i| i + 1).unwrap_or(0);
-        format!("{}{}", &cleaned[..prefix_end], &cleaned[prefix_end..prefix_end + 16])
+        format!(
+            "{}{}",
+            &cleaned[..prefix_end],
+            &cleaned[prefix_end..prefix_end + 16]
+        )
     } else {
         cleaned
     }
@@ -516,13 +520,23 @@ fn extract_layer(data: &[u8], media_type: &str, dest: &Path) -> Result<(), Error
     archive.set_preserve_permissions(true);
     archive.set_preserve_mtime(true);
 
-    for entry in archive.entries().map_err(|e| Error::Extract(e.to_string()))? {
+    for entry in archive
+        .entries()
+        .map_err(|e| Error::Extract(e.to_string()))?
+    {
         let mut entry = entry.map_err(|e| Error::Extract(e.to_string()))?;
-        let path_in_tar = entry.path().map_err(|e| Error::Extract(e.to_string()))?.into_owned();
+        let path_in_tar = entry
+            .path()
+            .map_err(|e| Error::Extract(e.to_string()))?
+            .into_owned();
 
         // Skip absolute paths / path traversal — tar entries should be
         // relative; oci-client images shouldn't include traversals.
-        if path_in_tar.is_absolute() || path_in_tar.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        if path_in_tar.is_absolute()
+            || path_in_tar
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
             warn!(path = %path_in_tar.display(), "skipping unsafe path");
             continue;
         }
@@ -592,7 +606,9 @@ fn remove_anything(target: &Path) {
 
 /// Remove every entry inside `dir` but keep `dir` itself.
 fn clear_dir_contents(dir: &Path) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in rd.flatten() {
         remove_anything(&entry.path());
     }
@@ -613,7 +629,9 @@ mod tests {
 
     #[test]
     fn digest_to_dir_strips_colon_and_truncates() {
-        let d = digest_to_dir("sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789");
+        let d = digest_to_dir(
+            "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+        );
         assert!(d.starts_with("sha256-"));
         assert!(d.len() <= 24);
     }
