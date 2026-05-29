@@ -47,20 +47,15 @@ pub enum WorkloadStrategy {
 }
 
 /// Per-invocation host vsock port policy.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub enum VsockPort {
     /// Don't attach a vsock device at all.
     Disabled,
     /// Pick a random free port in 50000..60000 per invocation.
+    #[default]
     Auto,
     /// Use the specified port.
     Fixed(u32),
-}
-
-impl Default for VsockPort {
-    fn default() -> Self {
-        Self::Auto
-    }
 }
 
 /// Host directory exposed as the guest's `/`.

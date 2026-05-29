@@ -12,6 +12,20 @@
 //! * Functions returning a status code use the [`VmetteStatus`] enum,
 //!   serialized as `int32_t` over the ABI.
 //! * Ownership is explicit via paired `*_new` / `*_free`.
+//!
+//! ## Safety (shared contract)
+//!
+//! Every function here is `unsafe` because it dereferences raw pointers
+//! crossing the C ABI. Unless a function's own `# Safety` note says otherwise,
+//! callers must uphold:
+//!
+//! * Handle pointers (`*mut`/`*const vmette_config_t`, `vmette_run_output_t`)
+//!   are either NULL (handled gracefully) or a live value returned by the
+//!   matching `*_new`/`vmette_run`, not yet passed to a `*_free`.
+//! * `*const c_char` arguments are either NULL or point to a NUL-terminated,
+//!   readable string (UTF-8 expected; invalid UTF-8 is rejected, not UB).
+//! * No referenced pointer is mutated by another thread for the duration of
+//!   the call.
 
 use std::ffi::{c_char, CStr};
 use std::path::PathBuf;
@@ -93,6 +107,9 @@ unsafe fn cfg_ref<'a>(p: *const vmette_config_t) -> Option<&'a Config> {
 
 /// Construct a new config with the minimum required fields. Returns NULL
 /// on null arguments or invalid UTF-8.
+///
+/// # Safety
+/// See the module-level safety contract.
 #[no_mangle]
 pub unsafe extern "C" fn vmette_config_new(
     kernel: *const c_char,
@@ -109,6 +126,10 @@ pub unsafe extern "C" fn vmette_config_new(
 }
 
 /// Free a config. No-op on NULL.
+///
+/// # Safety
+/// See the module-level safety contract. After this call `cfg` is dangling
+/// and must not be reused.
 #[no_mangle]
 pub unsafe extern "C" fn vmette_config_free(cfg: *mut vmette_config_t) {
     if cfg.is_null() {
@@ -119,6 +140,8 @@ pub unsafe extern "C" fn vmette_config_free(cfg: *mut vmette_config_t) {
 
 // ---- setters -----------------------------------------------------------
 
+/// # Safety
+/// See the module-level safety contract.
 #[no_mangle]
 pub unsafe extern "C" fn vmette_config_set_cmdline(
     cfg: *mut vmette_config_t,
@@ -130,6 +153,8 @@ pub unsafe extern "C" fn vmette_config_set_cmdline(
     }
 }
 
+/// # Safety
+/// See the module-level safety contract.
 #[no_mangle]
 pub unsafe extern "C" fn vmette_config_set_rootfs_share(
     cfg: *mut vmette_config_t,
@@ -142,6 +167,8 @@ pub unsafe extern "C" fn vmette_config_set_rootfs_share(
     }
 }
 
+/// # Safety
+/// See the module-level safety contract.
 #[no_mangle]
 pub unsafe extern "C" fn vmette_config_add_share(
     cfg: *mut vmette_config_t,
@@ -158,6 +185,8 @@ pub unsafe extern "C" fn vmette_config_add_share(
     c.shares.push(ShareMount { tag, path });
 }
 
+/// # Safety
+/// See the module-level safety contract.
 #[no_mangle]
 pub unsafe extern "C" fn vmette_config_add_disk(cfg: *mut vmette_config_t, path: *const c_char) {
     let Some(c) = cfg_mut(cfg) else { return };
@@ -166,12 +195,16 @@ pub unsafe extern "C" fn vmette_config_add_disk(cfg: *mut vmette_config_t, path:
     }
 }
 
+/// # Safety
+/// See the module-level safety contract.
 #[no_mangle]
 pub unsafe extern "C" fn vmette_config_set_exec(cfg: *mut vmette_config_t, cmd: *const c_char) {
     let Some(c) = cfg_mut(cfg) else { return };
     c.exec_cmd = cstr_to_string(cmd);
 }
 
+/// # Safety
+/// See the module-level safety contract.
 #[no_mangle]
 pub unsafe extern "C" fn vmette_config_set_net(cfg: *mut vmette_config_t, enable: bool) {
     if let Some(c) = cfg_mut(cfg) {
@@ -179,6 +212,8 @@ pub unsafe extern "C" fn vmette_config_set_net(cfg: *mut vmette_config_t, enable
     }
 }
 
+/// # Safety
+/// See the module-level safety contract.
 #[no_mangle]
 pub unsafe extern "C" fn vmette_config_set_switch_root(cfg: *mut vmette_config_t, enable: bool) {
     if let Some(c) = cfg_mut(cfg) {
@@ -190,6 +225,9 @@ pub unsafe extern "C" fn vmette_config_set_switch_root(cfg: *mut vmette_config_t
 /// `port < 0`  → disable the vsock device entirely.
 /// `port == 0` → auto-allocate per invocation (50000..60000).
 /// `port > 0`  → use that exact port.
+///
+/// # Safety
+/// See the module-level safety contract.
 #[no_mangle]
 pub unsafe extern "C" fn vmette_config_set_vsock_port(cfg: *mut vmette_config_t, port: i32) {
     let Some(c) = cfg_mut(cfg) else { return };
@@ -200,6 +238,8 @@ pub unsafe extern "C" fn vmette_config_set_vsock_port(cfg: *mut vmette_config_t,
     };
 }
 
+/// # Safety
+/// See the module-level safety contract.
 #[no_mangle]
 pub unsafe extern "C" fn vmette_config_set_guest_vsock_port(cfg: *mut vmette_config_t, port: u32) {
     if let Some(c) = cfg_mut(cfg) {
@@ -207,6 +247,8 @@ pub unsafe extern "C" fn vmette_config_set_guest_vsock_port(cfg: *mut vmette_con
     }
 }
 
+/// # Safety
+/// See the module-level safety contract.
 #[no_mangle]
 pub unsafe extern "C" fn vmette_config_set_timeout(cfg: *mut vmette_config_t, seconds: u32) {
     if let Some(c) = cfg_mut(cfg) {
@@ -216,6 +258,9 @@ pub unsafe extern "C" fn vmette_config_set_timeout(cfg: *mut vmette_config_t, se
 
 /// Note: no clamping. A value VZ rejects (e.g. 0) surfaces as
 /// `InvalidConfig` from `vmette_run` — same path as the Rust API.
+///
+/// # Safety
+/// See the module-level safety contract.
 #[no_mangle]
 pub unsafe extern "C" fn vmette_config_set_vcpus(cfg: *mut vmette_config_t, n: u8) {
     if let Some(c) = cfg_mut(cfg) {
@@ -224,6 +269,9 @@ pub unsafe extern "C" fn vmette_config_set_vcpus(cfg: *mut vmette_config_t, n: u
 }
 
 /// Note: no clamping. See `vmette_config_set_vcpus` for the rationale.
+///
+/// # Safety
+/// See the module-level safety contract.
 #[no_mangle]
 pub unsafe extern "C" fn vmette_config_set_mem_mib(cfg: *mut vmette_config_t, n: u64) {
     if let Some(c) = cfg_mut(cfg) {
@@ -233,6 +281,9 @@ pub unsafe extern "C" fn vmette_config_set_mem_mib(cfg: *mut vmette_config_t, n:
 
 /// Path to a snapshot file to write after the guest signals ready.
 /// Apple Silicon only — see VmetteStatus::SnapshotUnsupported.
+///
+/// # Safety
+/// See the module-level safety contract.
 #[no_mangle]
 pub unsafe extern "C" fn vmette_config_set_build_snapshot(
     cfg: *mut vmette_config_t,
@@ -243,6 +294,9 @@ pub unsafe extern "C" fn vmette_config_set_build_snapshot(
 }
 
 /// Path to a previously-saved snapshot to restore. Apple Silicon only.
+///
+/// # Safety
+/// See the module-level safety contract.
 #[no_mangle]
 pub unsafe extern "C" fn vmette_config_set_resume_snapshot(
     cfg: *mut vmette_config_t,
@@ -263,6 +317,10 @@ pub unsafe extern "C" fn vmette_config_set_resume_snapshot(
 /// Note: in the common path this function never returns — the underlying
 /// `vmette::run` exits the process via the VM's lifecycle delegate with
 /// the guest's exit code.
+///
+/// # Safety
+/// See the module-level safety contract. `out` must be a valid, writable
+/// pointer to a `*mut vmette_run_output_t`.
 #[no_mangle]
 pub unsafe extern "C" fn vmette_run(
     cfg: *const vmette_config_t,
@@ -284,6 +342,8 @@ pub unsafe extern "C" fn vmette_run(
     }
 }
 
+/// # Safety
+/// See the module-level safety contract.
 #[no_mangle]
 pub unsafe extern "C" fn vmette_run_output_exit_code(out: *const vmette_run_output_t) -> i32 {
     if out.is_null() {
@@ -293,6 +353,9 @@ pub unsafe extern "C" fn vmette_run_output_exit_code(out: *const vmette_run_outp
     r.exit_code
 }
 
+/// # Safety
+/// See the module-level safety contract. After this call `out` is dangling
+/// and must not be reused.
 #[no_mangle]
 pub unsafe extern "C" fn vmette_run_output_free(out: *mut vmette_run_output_t) {
     if out.is_null() {
