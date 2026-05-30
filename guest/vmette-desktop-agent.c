@@ -7,6 +7,13 @@
 // this binary links libX11 + libXtst dynamically and therefore lives
 // *inside* the desktop rootfs image, compiled against that image's libc.
 //
+// Synthetic typing (do_type) distills xdotool's scratch-keycode technique:
+// arbitrary text needs keysyms no fixed layout carries on a real key, so we
+// temporarily bind spare keycodes to the characters' keysyms and fake the keys.
+// Unlike xdotool we bind every distinct character of a string up front and sync
+// once, then fire all keystrokes against that fixed mapping — so no keymap
+// change ever races a synthetic key. See do_type for the full rationale.
+//
 // Wire protocol (must match crates/vmette/src/desktop.rs):
 //   request  (host → guest): [u32 LE header_len][header JSON]          (no payload)
 //   response (guest → host): [u32 LE header_len][header JSON][payload]  (payload optional)
@@ -261,39 +268,107 @@ static long utf8_next(const char **p) {
     return cp;
 }
 
-// Type a UTF-8 string by remapping a spare keycode to each character's
-// keysym (the robust xdotool approach: works for arbitrary characters
-// regardless of the current layout).
+// Latin-1 codepoints map 1:1 to their keysym; everything else uses the X11
+// Unicode keysym range (0x01000000 | codepoint).
+static KeySym cp_to_keysym(long cp) {
+    return (cp < 0x100) ? (KeySym)cp : (KeySym)(0x01000000 | cp);
+}
+
+// Type a UTF-8 string. This distills xdotool's scratch-keycode technique
+// (xdo_send_keysequence_window_list_do) but hoists the binding out of the
+// per-keystroke hot path: xdotool rebinds and reverts a single scratch keycode
+// around *every* keystroke, so each synthetic KeyPress races the focused
+// client's keymap-cache refresh (the client must process the MappingNotify and
+// call XRefreshKeyboardMapping before it can decode the key). Under a
+// software-rendered Xvfb in a VM that race loses intermittently — text comes
+// out with dropped, duplicated, or stale characters.
+//
+// Instead we bind each *distinct* character of the string to its own scratch
+// keycode up front, sync once, and let the client refresh its keymap a single
+// time. We then fire every keystroke against that now-fixed mapping with no
+// further mapping changes, so no MappingNotify ever interleaves with a key
+// event — the race is gone by construction. The mapping is re-established on
+// every call, so Xvfb's XKB layer (which silently recompiles its keymap and
+// reverts core-protocol remaps between calls) cannot strand us mid-session, and
+// repeated characters cost no extra remap.
+//
+// We map BOTH shift levels to the same keysym ({ks, ks}) so the bare keycode
+// emits the exact character with no modifier: X case-folds a lone alphabetic
+// keysym to lowercase at level 0, and binding level 1 explicitly sidesteps that
+// (xdotool instead holds Shift for uppercase).
 static int do_type(const char *text) {
-    int min_kc, max_kc;
-    XDisplayKeycodes(g_dpy, &min_kc, &max_kc);
-    // Pick a spare keycode near the top of the range to remap.
-    KeyCode spare = (KeyCode)max_kc;
-
-    // The server stores several keysyms per keycode (shift levels etc.). We
-    // must remap with that exact width — passing 1 leaves the keycode's real
-    // mapping untouched, so every char would emit the spare's stale keysym.
-    int per = 1;
-    KeySym *probe = XGetKeyboardMapping(g_dpy, spare, 1, &per);
-    if (probe) XFree(probe);
-    if (per < 1) per = 1;
-
-    const char *p = text;
-    long cp;
-    while ((cp = utf8_next(&p)) >= 0) {
-        KeySym ks = (cp < 0x100) ? (KeySym)cp : (KeySym)(0x01000000 | cp);
-        KeySym map[8];
-        int levels = per > 8 ? 8 : per;
-        for (int i = 0; i < levels; i++) map[i] = ks; // unshifted + shifted
-        XChangeKeyboardMapping(g_dpy, spare, levels, map, 1);
-        XSync(g_dpy, False);
-        // Let the focused client process the MappingNotify before the key.
-        usleep(2000);
-        XTestFakeKeyEvent(g_dpy, spare, True, CurrentTime);
-        XTestFakeKeyEvent(g_dpy, spare, False, CurrentTime);
-        XSync(g_dpy, False);
-        usleep(2000);
+    int lo, hi, per = 0;
+    XDisplayKeycodes(g_dpy, &lo, &hi);
+    KeySym *km = XGetKeyboardMapping(g_dpy, lo, hi - lo + 1, &per);
+    if (!km || per < 1) {
+        if (km) XFree(km);
+        return -1;
     }
+
+    // Scratch keycodes are those whose level-0 keysym is NoSymbol — unused, so
+    // safe to rebind without clobbering a real key.
+    KeyCode freekc[256];
+    int nfree = 0;
+    for (int kc = lo;
+         kc <= hi && nfree < (int)(sizeof(freekc) / sizeof(freekc[0])); kc++) {
+        if (km[(kc - lo) * per] == NoSymbol) freekc[nfree++] = (KeyCode)kc;
+    }
+    XFree(km);
+    if (nfree == 0) return -1;
+
+    // Pass 1: bind each distinct codepoint to its own scratch keycode.
+    long bound_cp[256];
+    int nbound = 0;
+    for (const char *p = text; *p && nbound < nfree;) {
+        long cp = utf8_next(&p);
+        if (cp < 0) break;
+        int seen = 0;
+        for (int b = 0; b < nbound; b++)
+            if (bound_cp[b] == cp) { seen = 1; break; }
+        if (seen) continue;
+        KeySym ks = cp_to_keysym(cp);
+        KeySym list[2] = { ks, ks };
+        XChangeKeyboardMapping(g_dpy, freekc[nbound], 2, list, 1);
+        bound_cp[nbound++] = cp;
+    }
+    // A single sync + settle: the client refreshes its keymap exactly once,
+    // after which the mapping is fixed for every keystroke below.
+    XSync(g_dpy, False);
+    usleep(20000);
+
+    // The last free keycode doubles as an overflow slot for the rare string
+    // with more distinct characters than we had scratch keycodes.
+    KeyCode overflow = freekc[nfree - 1];
+
+    // Pass 2: fire each character against the now-stable mapping.
+    for (const char *p = text; *p;) {
+        long cp = utf8_next(&p);
+        if (cp < 0) break;
+        KeyCode kc = 0;
+        for (int b = 0; b < nbound; b++)
+            if (bound_cp[b] == cp) { kc = freekc[b]; break; }
+        if (kc == 0) {
+            // Overflow char: rebind the spare keycode for just this keystroke.
+            KeySym ks = cp_to_keysym(cp);
+            KeySym list[2] = { ks, ks };
+            XChangeKeyboardMapping(g_dpy, overflow, 2, list, 1);
+            XSync(g_dpy, False);
+            usleep(20000);
+            kc = overflow;
+        }
+        XTestFakeKeyEvent(g_dpy, kc, True, CurrentTime);
+        usleep(6000); // split inter-key delay across down/up, like xdotool
+        XTestFakeKeyEvent(g_dpy, kc, False, CurrentTime);
+        XSync(g_dpy, False);
+        usleep(6000);
+    }
+
+    // Revert every scratch keycode we touched back to NoSymbol.
+    KeySym none[2] = { NoSymbol, NoSymbol };
+    for (int b = 0; b < nbound; b++)
+        XChangeKeyboardMapping(g_dpy, freekc[b], 2, none, 1);
+    XChangeKeyboardMapping(g_dpy, overflow, 2, none, 1);
+    XSync(g_dpy, False);
     return 0;
 }
 
@@ -416,7 +491,7 @@ static int handle(int fd, const char *json) {
         char text[8192];
         if (!json_str(json, "text", text, sizeof(text)))
             return send_err(fd, "missing text");
-        do_type(text);
+        if (do_type(text) < 0) return send_err(fd, "no scratch keycode");
         return send_ok(fd);
     } else if (!strcmp(action, "key")) {
         char keys[256];
@@ -469,6 +544,13 @@ int main(int argc, char **argv) {
     }
     g_screen = DefaultScreen(g_dpy);
     g_root = RootWindow(g_dpy, g_screen);
+
+    // Disable keyboard auto-repeat globally. If a synthetic key's press/release
+    // pair straddles a slow round-trip, the server can inject spurious repeat
+    // KeyPress events and typed text comes out with doubled characters. We never
+    // want auto-repeat on injected input.
+    XAutoRepeatOff(g_dpy);
+    XSync(g_dpy, False);
 
     int event_base, error_base, major, minor;
     if (!XTestQueryExtension(g_dpy, &event_base, &error_base, &major, &minor)) {
