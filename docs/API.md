@@ -48,8 +48,15 @@ fn main() -> Result<(), vmette::Error> {
 See [`crates/vmette/src/lib.rs`](../crates/vmette/src/lib.rs).
 
 - `Config` — fields are `pub`; populate directly after `Config::new`.
+  `set_rootfs_artifact(artifact, force_read_only)` applies a resolved
+  `RootfsArtifact` to the right field for you.
 - `VsockPort` — `Disabled` | `Auto` | `Fixed(u32)`.
-- `RootfsShare { path, read_only }`.
+- `RootfsShare { path, read_only }` — a host directory shared over
+  virtio-fs; held in `Config.rootfs_share`.
+- `RootfsArtifact` — what a provider's `resolve()` produces:
+  `Directory { path, read_only }` (virtio-fs share) or
+  `BlockImage { path, fstype }` (read-only block device + tmpfs overlay).
+- `BlockFs` — block-image filesystem tag; currently `Squashfs` only.
 - `ShareMount { tag, path }`.
 - `Error` (thiserror): `InvalidConfig`, `StartFailed`, `RestoreFailed`,
   `SaveFailed`, `SnapshotUnsupported`, `Timeout`, `Vsock`, `Io`.
@@ -59,27 +66,35 @@ See [`crates/vmette/src/lib.rs`](../crates/vmette/src/lib.rs).
 
 ### Rootfs providers
 
-The lib accepts a host directory path in `Config.rootfs_share`. For
-embedders who want the same `--rootfs SPEC` ergonomics the CLI offers,
-the `vmette::provider` module exposes a trait + registry:
+For a fixed directory you can set `Config.rootfs_share` directly. For the
+same `--rootfs SPEC` ergonomics the CLI offers — which may resolve to a
+directory *or* a block image — the `vmette::provider` module exposes a
+trait + registry, and `resolve()` returns a `RootfsArtifact`:
 
 ```rust
 use vmette::provider::{Context, DirProvider, Registry};
 use vmette_provider_oci::OciProvider;
+use vmette_provider_squashfs::SquashfsProvider;
 use vmette_provider_tar::TarProvider;
 
 let registry = Registry::new()
-    .with(DirProvider::new())   // claims path-like specs
-    .with(TarProvider::new())   // claims tar+http(s)://, tar+file://
-    .with(OciProvider::new());  // catch-all for bare refs + oci://
+    .with(DirProvider::new())       // claims path-like specs
+    .with(SquashfsProvider::new())  // claims squashfs+{file,http,https}://
+    .with(TarProvider::new())       // claims tar+http(s)://, tar+file://
+    .with(OciProvider::new());      // catch-all for bare refs + oci://
 
 let ctx = Context::new("/Users/me/Library/Caches/vmette")
     .offline(false)
     .guest_helpers_dir(Some("/usr/local/share/vmette/guest".into()));
 
-let rootfs = registry.resolve("alpine:3.20", &ctx)?;
-cfg.rootfs_share = Some(vmette::RootfsShare { path: rootfs, read_only: false });
+let artifact = registry.resolve("alpine:3.20", &ctx)?;   // RootfsArtifact
+cfg.set_rootfs_artifact(artifact, /*force_read_only=*/ false);
 ```
+
+To pull from a private OCI registry, inject credentials programmatically
+with `OciProvider::with_auth(resolver)`, or rely on the default resolver
+(`VMETTE_OCI_TOKEN` / `VMETTE_OCI_AUTH_<HOST>` → `~/.docker/config.json` →
+anonymous).
 
 `RootfsProvider` is the trait third-party code implements to teach
 vmette about new rootfs sources (S3 buckets, internal artifactories,

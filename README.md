@@ -6,9 +6,15 @@ dynamic library, and a long-lived daemon.
 
 - Boots a Linux guest in ~1 second
 - **Pluggable rootfs providers**: local directories, OCI/Docker images
-  (`alpine:3.20`, `ghcr.io/...`), or tarballs over HTTP/HTTPS/file —
-  dispatched through a single `--rootfs SPEC` flag. Add your own with
-  one trait impl in a sibling crate.
+  (`alpine:3.20`, `ghcr.io/...`, public or private), tarballs over
+  HTTP/HTTPS/file, or prebuilt squashfs block images — dispatched
+  through a single `--rootfs SPEC` flag. Add your own with one trait
+  impl in a sibling crate.
+- **Immutable block-image rootfs**: a `.sqfs` attaches read-only as
+  virtio-blk with a tmpfs overlay, so the base is content-addressable
+  and shareable across sessions (`--rootfs squashfs+…`).
+- **Private registry auth** for the OCI provider via env vars or
+  `~/.docker/config.json` (`VMETTE_OCI_TOKEN`).
 - virtio-fs for sharing host dirs, virtio-net (NAT), virtio-blk,
   vsock with bidirectional bytes
 - Exit-code propagation, timeout, switch-root, read-only rootfs share
@@ -57,6 +63,7 @@ vmette --rootfs alpine:3.20                         --exec 'cat /etc/alpine-rele
 vmette --rootfs oci://ghcr.io/foo/bar:v1            --exec '/run-tests.sh'
 vmette --rootfs tar+https://h/builds/r.tar.gz       --exec 'make ci'
 vmette --rootfs tar+file:///tmp/local-rootfs.tar    --exec 'ls /'
+vmette --rootfs squashfs+file:///tmp/base.sqfs      --exec 'ls /'
 ```
 
 The bundled orchestrator script auto-fetches assets on first run and
@@ -80,20 +87,24 @@ tarball URL, …) goes through the provider registry first.
 
 ```rust
 use vmette::provider::{Context, DirProvider, Registry};
-use vmette::{Config, RootfsShare};
+use vmette::Config;
 use vmette_provider_oci::OciProvider;
+use vmette_provider_squashfs::SquashfsProvider;
 use vmette_provider_tar::TarProvider;
 
 fn main() {
     let registry = Registry::new()
         .with(DirProvider::new())
+        .with(SquashfsProvider::new())
         .with(TarProvider::new())
         .with(OciProvider::new());
     let ctx = Context::new(std::env::var_os("HOME").unwrap_or_default());
-    let rootfs = registry.resolve("alpine:3.20", &ctx).unwrap();
+    // resolve() returns a RootfsArtifact (a directory share or a block
+    // image); set_rootfs_artifact wires whichever form into the config.
+    let artifact = registry.resolve("alpine:3.20", &ctx).unwrap();
 
     let mut cfg = Config::new("./assets/vmlinuz-virt", "./assets/initramfs-vmette");
-    cfg.rootfs_share = Some(RootfsShare { path: rootfs, read_only: false });
+    cfg.set_rootfs_artifact(artifact, false);
     cfg.exec_cmd = Some("echo hello from rust; exit 42".into());
 
     // vmette::run() blocks until guest poweroff and process-exits with
@@ -106,9 +117,10 @@ fn main() {
 
 ```toml
 [dependencies]
-vmette              = "0.1"
-vmette-provider-oci = "0.1"
-vmette-provider-tar = "0.1"  # optional; drop if you only need oci + dir
+vmette                   = "0.1"
+vmette-provider-oci      = "0.1"
+vmette-provider-tar      = "0.1"  # optional; drop if you only need oci + dir
+vmette-provider-squashfs = "0.1"  # optional; squashfs+ block images
 ```
 
 See [`crates/vmette/examples/minimal.rs`](crates/vmette/examples/minimal.rs).
@@ -237,8 +249,8 @@ action reference, and image build.
 ```
 crates/
   vmette/                Rust library (lib + cdylib + staticlib)
-    src/lib.rs           public API: Config, run(), VsockPort, RootfsShare, ShareMount
-    src/provider.rs      RootfsProvider trait + Registry + Context + DirProvider
+    src/lib.rs           public API: Config, run(), RootfsArtifact, VsockPort, RootfsShare, ShareMount
+    src/provider.rs      RootfsProvider trait + Registry + Context + DirProvider + RootfsArtifact
     src/ffi.rs           #[no_mangle] extern "C" shims → cbindgen
     src/vz/              objc2 bindings to VZ (config, delegate, vsock, snapshot)
     src/lifecycle.rs     run() orchestration + timeout + signal handlers
@@ -247,9 +259,10 @@ crates/
     src/cmdline.rs       base64 vmette.* cmdline assembly
     include/vmette.h     generated header (checked in)
     examples/            minimal.rs + minimal.c
-  vmette-provider-oci/   OCI/Docker image provider (alpine:3.20, oci://…)
-  vmette-provider-tar/   Tarball provider (tar+https://, tar+file://)
-  vmette-cli/            `vmette` CLI binary (registers dir/tar/oci providers)
+  vmette-provider-oci/      OCI/Docker image provider (alpine:3.20, oci://…, private-registry auth)
+  vmette-provider-tar/      Tarball provider (tar+https://, tar+file://)
+  vmette-provider-squashfs/ Squashfs block-image provider (squashfs+file://, squashfs+https://)
+  vmette-cli/            `vmette` CLI binary (registers dir/squashfs/tar/oci providers)
   vmette-daemon/         `vmetted` UNIX-socket dispatcher (tokio + JSON)
                          + desktop session registry (stateful, in-process VMs)
   vmette-mcp/            `vmette-mcp` Model Context Protocol server for AI agents
@@ -271,7 +284,7 @@ scripts/
   run.sh                 dev wrapper: ensures assets, builds, runs vmette
   install.sh             curl-pipe end-user installer
 tests/
-  run.sh                 end-to-end smoke (10 gates)
+  run.sh                 end-to-end smoke (~20 gates)
   fixtures/share/        committed sample for --share TAG=PATH
 .github/workflows/
   release.yml            tag-triggered make universal + dist + upload

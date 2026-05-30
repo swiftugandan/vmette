@@ -1,8 +1,15 @@
 # vmetted — long-lived UNIX-socket dispatcher
 
-`vmetted` listens on a UNIX socket and dispatches one guest run per
-connection. v0.1 spawns the `vmette` CLI as a subprocess per request;
-v0.2 (Apple Silicon) will add an in-process warm-snapshot pool.
+`vmetted` listens on a UNIX socket and serves two request families over
+the same protocol:
+
+- **Stateless runs** — one guest run per connection, dispatched by
+  spawning the `vmette` CLI as a subprocess (the schema below). A
+  warm-snapshot pool to replace the per-request cold boot is on the
+  roadmap for v0.2 (Apple Silicon).
+- **Stateful desktop sessions** — `desktop_*` requests that drive a
+  persistent in-process VM held across connections (see
+  [Desktop session requests](#desktop-session-requests)).
 
 ## Run
 
@@ -55,8 +62,8 @@ Line-delimited JSON. One request per connection.
 `rootfs` is required and follows the same spec format as the CLI's
 `--rootfs` flag — a path (`/abs/path` or `./rel`), a bare image ref
 (`alpine:3.20`), or a scheme-prefixed URL (`oci://…`, `tar+https://…`,
-`tar+file://…`). See [`CLI.md`](CLI.md#rootfs-providers) for the
-shipped providers.
+`tar+file://…`, `squashfs+file://…`). See
+[`CLI.md`](CLI.md#rootfs-providers) for the shipped providers.
 
 `rootfs_ro`, `offline`, `shares`, `disks`, `timeout_seconds`, `net`,
 `switch_root` are optional. `vsock_port` is `-1` (disable) / `0`
@@ -119,6 +126,27 @@ echo '{"kernel":"/k","initramfs":"/i","rootfs":"/p","exec":"true"}' | \
   jq -r 'select(.kind == "exit") | "exit \(.code)"'
 ```
 
+## Desktop session requests
+
+Beyond the stateless run protocol, the daemon serves a **stateful**
+computer-use path on the same socket: a `desktop_start` boots a persistent
+graphical VM that the daemon holds in-process across connections, and
+later requests act against it by `session_id`. Sessions are capped, idle-
+evicted, and torn down on shutdown. See [`DESKTOP.md`](DESKTOP.md) for the
+session model, the `Action` vocabulary, and the image build.
+
+Each request is still one JSON object per connection, tagged by `kind`:
+
+| `kind` | Key fields | Reply |
+|--------|-----------|-------|
+| `desktop_start` | `kernel`, `initramfs`, `image?`, `size?` (`"WxH"`), `net?`, `offline?`, `vcpus?`, `mem_mib?` | `{"kind":"session","session_id":"…"}` |
+| `desktop_action` | `session_id`, `action` (a `vmette::Action`, e.g. `{"type":"screenshot"}`, mouse/key/type/scroll/exec) | `{"kind":"action_result","ok":true,"x?":…,"y?":…,"png_base64?":"…"}` |
+| `desktop_screenshot_settled` | `session_id`, `timeout_ms?` (default 10000) | `{"kind":"settled","settled":bool,"moving":[…],"png_base64":"…"}` |
+| `desktop_what_changed` | `session_id` | fresh frame + damage region |
+| `desktop_stop` | `session_id` | `{"kind":"action_result","ok":true}` |
+
+A daemon-side failure on any kind returns `{"kind":"error","message":"…"}`.
+
 ## v0.1 vs v0.2
 
 | Feature | v0.1 (now) | v0.2 (roadmap, aarch64 only) |
@@ -133,5 +161,6 @@ echo '{"kernel":"/k","initramfs":"/i","rootfs":"/p","exec":"true"}' | \
 |----------|------|
 | One-off invocation from a shell | `vmette` |
 | Many short-lived invocations from a long-lived process | `vmetted` |
+| Persistent desktop / computer-use sessions | `vmetted` (`desktop_*`) |
 | Library embedding from Rust/C | link `libvmette` directly |
 | Future warm-VM pool (aarch64) | `vmetted` v0.2 |

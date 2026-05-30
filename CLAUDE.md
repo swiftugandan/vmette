@@ -16,12 +16,12 @@ cargo test --workspace                   # unit + integration tests
 ```
 
 All three must be clean. `make test` additionally runs the end-to-end VM smoke
-(`tests/run.sh`, ~10 gates) — it boots real VMs, so it requires a codesigned
+(`tests/run.sh`, ~20 gates) — it boots real VMs, so it requires a codesigned
 binary and macOS.
 
 ## Workspace layout
 
-Six crates (workspace `version = 0.1.0`, edition 2021, `rust-version = 1.80`, MIT):
+Seven crates (workspace `version = 0.1.0`, edition 2021, `rust-version = 1.80`, MIT):
 
 | Crate | Purpose |
 |-------|---------|
@@ -29,13 +29,16 @@ Six crates (workspace `version = 0.1.0`, edition 2021, `rust-version = 1.80`, MI
 | `crates/vmette-cli` | `vmette` CLI binary. Hand-rolled arg parsing (no clap — keeps the binary small). |
 | `crates/vmette-daemon` | `vmetted` — UNIX-socket dispatcher (tokio). Stateless subprocess dispatch + stateful desktop registry. |
 | `crates/vmette-mcp` | MCP server (`vmette-mcp`) exposing vmette to AI agents over stdio. |
-| `crates/vmette-provider-oci` | OCI/Docker image rootfs provider (catch-all for bare refs + `oci://`). |
+| `crates/vmette-provider-oci` | OCI/Docker image rootfs provider (catch-all for bare refs + `oci://`); per-registry `AuthResolver` for private images. |
+| `crates/vmette-provider-squashfs` | Squashfs block-image rootfs provider (`squashfs+file://`, `squashfs+https://`, `squashfs+http://`). Returns `BlockImage`. |
 | `crates/vmette-provider-tar` | Tarball rootfs provider (`tar+https://`, `tar+http://`, `tar+file://`). |
 
 ## Core library — `crates/vmette/src/`
 
 - **`lib.rs`** — public API: `Config`, `run()`, `Session`, `WorkloadStrategy`
-  (`OneShot` | `Agent`), `VsockPort`, `RootfsShare`, `ShareMount`, `RunOutput`.
+  (`OneShot` | `Agent`), `RootfsArtifact` (`Directory` | `BlockImage`) +
+  `Config::set_rootfs_artifact`, `VsockPort`, `RootfsShare`, `ShareMount`,
+  `RunOutput`.
 - **`session.rs`** — the **`Session` primitive**: owns a live booted VM + its
   private VZ dispatch queue + teardown. `Session` is `!Send` (holds objc2
   `Retained`), so it runs on its own OS thread and hands out the `Send` handles
@@ -44,14 +47,17 @@ Six crates (workspace `version = 0.1.0`, edition 2021, `rust-version = 1.80`, MI
 - **`lifecycle.rs`** — `run()` is a thin **OneShot** wrapper over `Session`:
   raw-mode + signal handlers, start, block on terminal event, exit with the
   guest's code. Snapshot build/resume dispatch lives here too.
-- **`provider.rs`** — `RootfsProvider` trait + `Registry` dispatcher + `Context`
-  (cache root, offline flag, optional guest-helpers dir). Built-in `DirProvider`;
-  OCI/tar live in sibling crates.
+- **`provider.rs`** — `RootfsProvider` trait (`provide` returns a
+  `RootfsArtifact`: `Directory` for a virtio-fs share or `BlockImage` for a
+  read-only block device) + `Registry` dispatcher + `Context` (cache root,
+  offline flag, optional guest-helpers dir). Built-in `DirProvider`;
+  OCI/tar/squashfs live in sibling crates.
 - **`desktop.rs`** — framed vsock protocol `[u32 LE header_len][JSON header][optional binary payload]`,
   the `Action` enum (screenshot/clicks/type/key/scroll/… mirroring Anthropic
   computer use) and `ResponseHeader`. Pure types — no VZ/objc2.
 - **`cmdline.rs`** — assembles the kernel cmdline, emitting `vmette.*=…` tokens
-  (exec base64, rootfs, shares, net, vsock_port, switch_root, snapshot mode,
+  (exec base64, rootfs, `rootfs_block=squashfs` + auto `ctl` control share for
+  block images, shares, net, vsock_port, switch_root, snapshot mode,
   `vmette.desktop=1` + `vmette.display=WxH` for the Agent strategy).
 - **`ffi.rs`** — the C ABI (cbindgen → `include/vmette.h`). Opaque
   `#[repr(C)]` handles, paired `*_new`/`*_free`, `VmetteStatus` i32 codes. Every

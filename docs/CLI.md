@@ -55,27 +55,56 @@ On Intel, snapshot flags exit 1 with a clear error pointing at Apple's
 
 `--rootfs SPEC` is dispatched to a provider by matching the spec's
 prefix or scheme. Order is registration order, first-match-wins. The
-shipped CLI registers three:
+shipped CLI registers four:
 
 | Provider | Claims | Examples |
 |----------|--------|----------|
 | `dir` | absolute paths, `./`, `../`, `~/` | `--rootfs /path/to/rootfs`<br>`--rootfs ./assets/alpine-rootfs`<br>`--rootfs ~/projects/vmette/rootfs` |
+| `squashfs` | `squashfs+http://`, `squashfs+https://`, `squashfs+file://` | `--rootfs squashfs+file:///tmp/base.sqfs`<br>`--rootfs squashfs+https://example.com/base.sqfs` |
 | `tar` | `tar+http://`, `tar+https://`, `tar+file://` | `--rootfs tar+https://example.com/rootfs.tar.gz`<br>`--rootfs tar+file:///tmp/rootfs.tar` |
 | `oci` | `oci://<ref>`, plus any bare image ref (catch-all) | `--rootfs alpine:3.20`<br>`--rootfs python:3.12-alpine`<br>`--rootfs oci://ghcr.io/foo/bar:tag` |
 
 Run `vmette providers` to print the live registry.
+
+The `dir`/`tar`/`oci` providers deliver a host **directory** shared over
+virtio-fs. The `squashfs` provider instead returns a **block image**: the
+`.sqfs` is attached read-only as virtio-blk slot 0 (`/dev/vda`) and the
+guest mounts it under a tmpfs overlay, so the rootfs is immutable and the
+same base can back many concurrent sessions. Because a block rootfs has no
+host-writable surface, exit-code propagation rides a small auto-attached
+`ctl` virtio-fs share instead of `/.vmette-exit` on the rootfs.
 
 ### Provider caches
 
 | Provider | Cache location |
 |----------|----------------|
 | `dir` | none — your directory is used in place |
+| `squashfs` | `squashfs+file://` used in place; `squashfs+http(s)://` cached at `~/Library/Caches/vmette/squashfs/<key>.sqfs` |
 | `tar` | `~/Library/Caches/vmette/tar/<sanitized-url>/` |
 | `oci` | `~/Library/Caches/vmette/oci/<sanitized-ref>__<digest>/rootfs/` plus `refs/<sanitized-ref>.digest` |
 
 The OCI provider keeps a 1-hour soft TTL on `refs/<ref>.digest` mtime; a
 fresh ref entry skips the registry roundtrip entirely. `--offline` short-
 circuits that further — no network at all, even for digest verification.
+The squashfs provider applies the same offline rule and downloads remote
+images with a streaming size cap (`VMETTE_SQUASHFS_MAX_BYTES`, default
+4 GiB). The tar provider has the equivalent cap on extracted size
+(`VMETTE_TAR_MAX_BYTES`).
+
+### Private OCI registries
+
+The OCI provider resolves credentials per-registry host, in precedence
+order: env vars, then `~/.docker/config.json`, then anonymous.
+
+| Var | Effect |
+|-----|--------|
+| `VMETTE_OCI_TOKEN` | Password/token; sent as `Basic(<user>, token)`. |
+| `VMETTE_OCI_USER` | Username paired with `VMETTE_OCI_TOKEN` (default `vmette`). |
+| `VMETTE_OCI_AUTH_<HOST>` | Per-host `user:secret` override (e.g. `VMETTE_OCI_AUTH_GHCR_IO`), checked before `VMETTE_OCI_TOKEN`. |
+
+`~/.docker/config.json` is read for `auths[registry].auth` (base64
+`user:pass`) only — `credsStore` / `credHelpers` (external credential
+binaries) are not supported. With no match, pulls stay anonymous.
 
 Guest helpers (`vsock-send`, `vsock-runner`) are injected into the
 extracted rootfs at `/usr/local/bin/` automatically by the OCI and tar
@@ -124,6 +153,12 @@ vmette ... --rootfs alpine:3.20 --offline --exec 'cat /etc/alpine-release'
 # tarball over HTTPS, gzip auto-detected
 vmette ... --rootfs tar+https://example.com/builds/golden.tar.gz --exec 'make ci'
 
+# prebuilt squashfs block image (read-only base + tmpfs overlay)
+vmette ... --rootfs squashfs+file:///tmp/base.sqfs --exec 'cat /etc/os-release'
+
+# private OCI image (token via env)
+VMETTE_OCI_TOKEN=ghp_xxx vmette ... --rootfs oci://ghcr.io/me/private:tag --exec '/run.sh'
+
 # extra share + bidirectional file IO
 mkdir -p /tmp/scratch
 vmette ... --rootfs ./assets/alpine-rootfs \
@@ -141,8 +176,10 @@ vmette ... --rootfs-ro --exec 'mount | grep rootfs'
 
 ## Writing a new provider
 
-The CLI registers Dir/Tar/Oci providers from sibling crates. To add a
-fourth, implement `vmette::provider::RootfsProvider` in a new crate and
-register it before constructing the CLI app — or fork the CLI and add
-your provider to `default_registry()`. See the `vmette-provider-tar`
-crate (~150 LOC) for a minimal example.
+The CLI registers Dir/Squashfs/Tar/Oci providers from sibling crates. To
+add another, implement `vmette::provider::RootfsProvider` in a new crate
+and register it before constructing the CLI app — or fork the CLI and add
+your provider to `default_registry()`. A provider's `provide()` returns a
+`RootfsArtifact` (`Directory` for a virtio-fs share, `BlockImage` for a
+block device); see the `vmette-provider-tar` crate (~150 LOC) for a
+minimal directory example.
