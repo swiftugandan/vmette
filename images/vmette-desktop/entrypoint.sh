@@ -52,5 +52,10 @@ fi
 echo "[desktop] starting openbox" >&2
 openbox >/var/log/openbox.log 2>&1 &
 
+# Paint the root window a neutral colour. Openbox sets no wallpaper, so an idle
+# desktop is otherwise pure black — which reads as a broken/blank capture to an
+# agent taking its first screenshot before launching any app.
+xsetroot -solid '#2e3440' 2>/dev/null || true
+
 echo "[desktop] exec agent → host:${HOST_PORT}" >&2
 exec vmette-desktop-agent "$HOST_PORT" :99
