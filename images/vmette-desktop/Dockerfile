@@ -47,9 +47,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Browser for computer-use demos. Comment out to shrink the image; the agent
-# works without it (you can `exec` any X app). Note: this pushes the image
-# past the tar provider's 512 MiB cap, so use the OCI provider (push to a
-# registry) for the browser variant; the slim/no-browser variant fits tar.
+# works without it (you can `exec` any X app). The image is ~913 MB
+# uncompressed, but the tar provider's 512 MiB cap applies to the *gzipped*
+# rootfs export, which lands around ~320 MiB — so the browser variant still
+# fits the tar provider; the OCI provider (registry push) remains an option.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         chromium \
     && rm -rf /var/lib/apt/lists/* || true
