@@ -10,11 +10,9 @@ mod desktop;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use vmette::provider::{Context, DirProvider, Registry};
+use vmette::provider::{Context, Registry};
 use vmette::{Config, RootfsArtifact, ShareMount, VsockPort};
-use vmette_provider_oci::OciProvider;
-use vmette_provider_squashfs::SquashfsProvider;
-use vmette_provider_tar::TarProvider;
+use vmette_providers::default_registry;
 
 fn usage() -> ! {
     eprintln!(
@@ -326,18 +324,6 @@ fn guest_helpers_dir() -> Option<PathBuf> {
         return Some(repo);
     }
     None
-}
-
-fn default_registry() -> Registry {
-    // Order matters — first-match-wins. DirProvider claims path-like
-    // specs, SquashfsProvider + TarProvider claim their `<fs>+`/`tar+`
-    // schemes, OciProvider is the catch-all for everything else (bare
-    // image refs, oci://).
-    Registry::new()
-        .with(DirProvider::new())
-        .with(SquashfsProvider::new())
-        .with(TarProvider::new())
-        .with(OciProvider::new())
 }
 
 fn print_providers(registry: &Registry) {

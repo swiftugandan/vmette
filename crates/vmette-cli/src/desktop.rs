@@ -5,7 +5,9 @@
 //!
 //! Each subcommand is one request/one reply over the daemon's UNIX socket
 //! (line-delimited JSON), so this is plain blocking `std::os::unix::net`
-//! rather than tokio — no async runtime in the CLI.
+//! rather than tokio — no async runtime in the CLI. Requests and replies are
+//! the shared [`vmette_proto`] wire types, so a field renamed in the protocol
+//! is a compile error here, not a silent runtime break.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -13,7 +15,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use base64::Engine as _;
-use serde_json::{json, Value};
+use vmette_proto::agent::{Action, ScrollDirection};
+use vmette_proto::daemon::{
+    ActionReply, DesktopAction, DesktopReply, DesktopRequest, DesktopStart, DesktopStop,
+};
 
 fn default_socket() -> PathBuf {
     let home = std::env::var_os("HOME").unwrap_or_default();
@@ -45,8 +50,9 @@ fn desktop_usage() -> ! {
     std::process::exit(2);
 }
 
-/// Send one request line and read the single JSON reply line back.
-fn call(socket: &PathBuf, req: &Value) -> Result<Value, String> {
+/// Send one request and read the single reply back, mapping a daemon
+/// [`DesktopReply::Error`] to an `Err`.
+fn call(socket: &PathBuf, req: &DesktopRequest) -> Result<DesktopReply, String> {
     let stream = UnixStream::connect(socket).map_err(|e| {
         format!(
             "connect {} failed: {e} (is vmetted running?)",
@@ -63,32 +69,31 @@ fn call(socket: &PathBuf, req: &Value) -> Result<Value, String> {
     BufReader::new(stream)
         .read_line(&mut reply)
         .map_err(|e| e.to_string())?;
-    if reply.trim().is_empty() {
+    let reply = reply.trim();
+    if reply.is_empty() {
         return Err("daemon closed the connection without replying".into());
     }
-    serde_json::from_str(reply.trim()).map_err(|e| format!("bad reply: {e}: {}", reply.trim()))
-}
-
-/// Map a `kind: "error"` reply to an Err; otherwise pass the value through.
-fn ok_or_err(v: Value) -> Result<Value, String> {
-    if v.get("kind").and_then(Value::as_str) == Some("error") {
-        let msg = v
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown error");
-        return Err(msg.to_string());
+    let reply: DesktopReply =
+        serde_json::from_str(reply).map_err(|e| format!("bad reply: {e}: {reply}"))?;
+    match reply {
+        DesktopReply::Error(e) => Err(e.message),
+        other => Ok(other),
     }
-    Ok(v)
 }
 
-/// Send a `desktop_action` carrying `action` and return the reply (already
-/// error-checked).
-fn action(socket: &PathBuf, session: &str, action: Value) -> Result<Value, String> {
+/// Send a `desktop_action` carrying `action` and return its action reply.
+fn action(socket: &PathBuf, session: &str, action: Action) -> Result<ActionReply, String> {
     let reply = call(
         socket,
-        &json!({ "kind": "desktop_action", "session_id": session, "action": action }),
+        &DesktopRequest::DesktopAction(DesktopAction {
+            session_id: session.to_string(),
+            action,
+        }),
     )?;
-    ok_or_err(reply)
+    match reply {
+        DesktopReply::ActionResult(r) => Ok(r),
+        other => Err(format!("unexpected reply to action: {other:?}")),
+    }
 }
 
 /// Pull a positional arg or exit with usage.
@@ -138,32 +143,36 @@ pub fn run(mut args: Vec<String>) -> ExitCode {
             let s = pos(&args, 0, "SESSION_ID");
             let x = parse_i32(&pos(&args, 1, "X"), "X");
             let y = parse_i32(&pos(&args, 2, "Y"), "Y");
-            action(&socket, &s, json!({"action":"mouse_move","x":x,"y":y})).map(|_| None)
+            action(&socket, &s, Action::MouseMove { x, y }).map(|_| None)
         }
-        "click" => cmd_click(&socket, &args, "left_click"),
-        "double-click" => cmd_click(&socket, &args, "double_click"),
-        "right-click" => cmd_click(&socket, &args, "right_click"),
+        "click" => cmd_click(&socket, &args, Action::LeftClick),
+        "double-click" => cmd_click(&socket, &args, Action::DoubleClick),
+        "right-click" => cmd_click(&socket, &args, Action::RightClick),
         "type" => {
             let s = pos(&args, 0, "SESSION_ID");
             let text = pos(&args, 1, "TEXT");
-            action(&socket, &s, json!({"action":"type","text":text})).map(|_| None)
+            action(&socket, &s, Action::Type { text }).map(|_| None)
         }
         "key" => {
             let s = pos(&args, 0, "SESSION_ID");
             let keys = pos(&args, 1, "CHORD");
-            action(&socket, &s, json!({"action":"key","keys":keys})).map(|_| None)
+            action(&socket, &s, Action::Key { keys }).map(|_| None)
         }
         "scroll" => cmd_scroll(&socket, &args),
         "exec" => {
             let s = pos(&args, 0, "SESSION_ID");
             let command = pos(&args, 1, "COMMAND");
-            action(&socket, &s, json!({"action":"exec","command":command})).map(|_| None)
+            action(&socket, &s, Action::Exec { command }).map(|_| None)
         }
         "stop" => {
             let s = pos(&args, 0, "SESSION_ID");
-            call(&socket, &json!({ "kind": "desktop_stop", "session_id": s }))
-                .and_then(ok_or_err)
-                .map(|_| Some(format!("stopped {s}")))
+            call(
+                &socket,
+                &DesktopRequest::DesktopStop(DesktopStop {
+                    session_id: s.clone(),
+                }),
+            )
+            .map(|_| Some(format!("stopped {s}")))
         }
         "-h" | "--help" => desktop_usage(),
         other => {
@@ -209,26 +218,24 @@ fn cmd_start(socket: &PathBuf, args: &[String]) -> Result<Option<String>, String
     let kernel = vmette_assets::require_asset(kernel, "vmlinuz-virt")?;
     let initramfs = vmette_assets::require_asset(initramfs, "initramfs-vmette")?;
 
-    let mut req = json!({
-        "kind": "desktop_start",
-        "kernel": kernel,
-        "initramfs": initramfs,
-        "net": net,
-        "offline": offline,
-    });
-    if let Some(img) = image {
-        req["image"] = json!(img);
+    // `vcpus`/`mem_mib` left unset → the daemon applies its desktop defaults.
+    let reply = call(
+        socket,
+        &DesktopRequest::DesktopStart(DesktopStart {
+            kernel,
+            initramfs,
+            image,
+            size,
+            net,
+            offline,
+            vcpus: None,
+            mem_mib: None,
+        }),
+    )?;
+    match reply {
+        DesktopReply::Session(s) => Ok(Some(s.session_id)),
+        other => Err(format!("daemon did not return a session_id: {other:?}")),
     }
-    if let Some(sz) = size {
-        req["size"] = json!(sz);
-    }
-
-    let reply = ok_or_err(call(socket, &req)?)?;
-    let id = reply
-        .get("session_id")
-        .and_then(Value::as_str)
-        .ok_or("daemon did not return a session_id")?;
-    Ok(Some(id.to_string()))
 }
 
 fn cmd_screenshot(socket: &PathBuf, args: &[String]) -> Result<Option<String>, String> {
@@ -241,11 +248,8 @@ fn cmd_screenshot(socket: &PathBuf, args: &[String]) -> Result<Option<String>, S
         }
     }
     let out = out.ok_or("screenshot needs --out FILE")?;
-    let reply = action(socket, &session, json!({"action":"screenshot"}))?;
-    let b64 = reply
-        .get("png_base64")
-        .and_then(Value::as_str)
-        .ok_or("reply had no png_base64")?;
+    let reply = action(socket, &session, Action::Screenshot)?;
+    let b64 = reply.png_base64.ok_or("reply had no png_base64")?;
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(b64)
         .map_err(|e| format!("decode png: {e}"))?;
@@ -259,20 +263,20 @@ fn cmd_screenshot(socket: &PathBuf, args: &[String]) -> Result<Option<String>, S
 
 fn cmd_cursor(socket: &PathBuf, args: &[String]) -> Result<Option<String>, String> {
     let session = pos(args, 0, "SESSION_ID");
-    let reply = action(socket, &session, json!({"action":"cursor_position"}))?;
-    let x = reply.get("x").and_then(Value::as_i64).unwrap_or(0);
-    let y = reply.get("y").and_then(Value::as_i64).unwrap_or(0);
+    let reply = action(socket, &session, Action::CursorPosition)?;
+    let x = reply.x.unwrap_or(0);
+    let y = reply.y.unwrap_or(0);
     Ok(Some(format!("{x} {y}")))
 }
 
 /// Move to X Y then click. Click actions fire at the current pointer position,
 /// so we position first for ergonomic `click X Y`.
-fn cmd_click(socket: &PathBuf, args: &[String], click: &str) -> Result<Option<String>, String> {
+fn cmd_click(socket: &PathBuf, args: &[String], click: Action) -> Result<Option<String>, String> {
     let session = pos(args, 0, "SESSION_ID");
     let x = parse_i32(&pos(args, 1, "X"), "X");
     let y = parse_i32(&pos(args, 2, "Y"), "Y");
-    action(socket, &session, json!({"action":"mouse_move","x":x,"y":y}))?;
-    action(socket, &session, json!({ "action": click }))?;
+    action(socket, &session, Action::MouseMove { x, y })?;
+    action(socket, &session, click)?;
     Ok(None)
 }
 
@@ -282,14 +286,22 @@ fn cmd_scroll(socket: &PathBuf, args: &[String]) -> Result<Option<String>, Strin
     let y = parse_i32(&pos(args, 2, "Y"), "Y");
     let dir = pos(args, 3, "DIR");
     let amount = parse_i32(&pos(args, 4, "AMOUNT"), "AMOUNT");
-    match dir.as_str() {
-        "up" | "down" | "left" | "right" => {}
+    let direction = match dir.as_str() {
+        "up" => ScrollDirection::Up,
+        "down" => ScrollDirection::Down,
+        "left" => ScrollDirection::Left,
+        "right" => ScrollDirection::Right,
         other => return Err(format!("DIR must be up|down|left|right, got '{other}'")),
-    }
+    };
     action(
         socket,
         &session,
-        json!({"action":"scroll","x":x,"y":y,"direction":dir,"amount":amount}),
+        Action::Scroll {
+            x,
+            y,
+            direction,
+            amount,
+        },
     )?;
     Ok(None)
 }

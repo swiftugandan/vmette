@@ -11,12 +11,12 @@ name = "vmette"
 path = "src/main.rs"
 
 [dependencies]
-vmette                   = { path = "../vmette" }
-vmette-assets            = { path = "../vmette-assets" }
-vmette-provider-oci      = { path = "../vmette-provider-oci" }
-vmette-provider-squashfs = { path = "../vmette-provider-squashfs" }
-vmette-provider-tar      = { path = "../vmette-provider-tar" }
-tracing-subscriber       = { version = "0.3", features = ["env-filter"] }
-# `vmette desktop` subcommands talk to vmetted over its UNIX socket.
+vmette            = { path = "../vmette" }
+vmette-assets     = { path = "../vmette-assets" }
+vmette-proto      = { path = "../vmette-proto" }
+vmette-providers  = { path = "../vmette-providers" }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# `vmette desktop` subcommands talk to vmetted over its UNIX socket, building
+# requests / parsing replies as the shared vmette-proto wire types.
 serde_json          = "1"
 base64              = "0.22"
