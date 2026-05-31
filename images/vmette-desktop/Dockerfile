@@ -44,7 +44,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libxtst6 \
         fonts-dejavu-core \
         ca-certificates \
+        locales \
     && rm -rf /var/lib/apt/lists/*
+
+# Generate a UTF-8 locale. The C locale drops typed non-ASCII (é, €, …) in
+# xterm and other apps; en_US.UTF-8 lets them accept the full keymap. The locale
+# is *exported* at runtime by entrypoint.sh (the single source of truth) — a
+# Dockerfile `ENV LANG=…` would not reach a vmette boot, which chroots into this
+# rootfs from the initramfs and never applies Docker's image config.
+RUN sed -i 's/# en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen \
+    && locale-gen
 
 # Browser for computer-use demos. Comment out to shrink the image; the agent
 # works without it (you can `exec` any X app). The image is ~913 MB
@@ -64,7 +73,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # otherwise sits across the top of every frame the agent sees.
 RUN mkdir -p /etc/chromium.d \
     && printf '%s\n' \
-        'export CHROMIUM_FLAGS="$CHROMIUM_FLAGS --no-sandbox --test-type --disable-dev-shm-usage --disable-gpu --disable-gpu-compositing --use-gl=swiftshader --no-first-run --disable-features=Translate"' \
+        'export CHROMIUM_FLAGS="$CHROMIUM_FLAGS --no-sandbox --test-type --disable-dev-shm-usage --disable-gpu --disable-gpu-compositing --use-gl=swiftshader --no-first-run --disable-features=Translate --disable-session-crashed-bubble --hide-crash-restore-bubble"' \
         > /etc/chromium.d/00-vmette-swiftshader
 
 COPY --from=builder /usr/local/bin/vmette-desktop-agent /usr/local/bin/vmette-desktop-agent

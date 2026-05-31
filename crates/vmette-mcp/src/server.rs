@@ -625,6 +625,33 @@ impl VmetteServer {
             .await
     }
 
+    #[tool(description = "Middle-click (button 2 / paste-selection / open-in-new-tab) at (x,y).")]
+    async fn desktop_middle_click(
+        &self,
+        Parameters(args): Parameters<DesktopPointArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.click_at(&args.session_id, args.x, args.y, Action::MiddleClick)
+            .await
+    }
+
+    #[tool(
+        description = "Press the left button, move to (x,y), and release — a drag. The drag STARTS at the current pointer position, so desktop_move there first. Use for text selection, sliders/scrollbars, drag-and-drop, and canvas drawing."
+    )]
+    async fn desktop_drag(
+        &self,
+        Parameters(args): Parameters<DesktopPointArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.action(
+            &args.session_id,
+            Action::LeftClickDrag {
+                x: args.x,
+                y: args.y,
+            },
+        )
+        .await?;
+        Ok(ok_text(format!("dragged to {} {}", args.x, args.y)))
+    }
+
     #[tool(description = "Type a UTF-8 string at the current keyboard focus.")]
     async fn desktop_type(
         &self,
@@ -875,6 +902,7 @@ fn click_label(a: &Action) -> &'static str {
         Action::LeftClick => "left_click",
         Action::DoubleClick => "double_click",
         Action::RightClick => "right_click",
+        Action::MiddleClick => "middle_click",
         _ => "click",
     }
 }

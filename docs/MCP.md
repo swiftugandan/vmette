@@ -196,7 +196,8 @@ look at. Full reference, protocol, and image build in
 | `desktop_screenshot_when_settled` | `session_id`, `timeout_ms?` | note + PNG, once the screen has stopped changing and stayed still |
 | `desktop_what_changed` | `session_id` | note + PNG of the region changed since the last capture |
 | `desktop_cursor_position` | `session_id` | `"x y"` |
-| `desktop_move` / `desktop_click` / `desktop_double_click` / `desktop_right_click` | `session_id`, `x`, `y` | status |
+| `desktop_move` / `desktop_click` / `desktop_double_click` / `desktop_right_click` / `desktop_middle_click` | `session_id`, `x`, `y` | status |
+| `desktop_drag` | `session_id`, `x`, `y` | status — press-move-release from the current pointer to `(x, y)`: text selection, sliders, drag-and-drop, drawing |
 | `desktop_type` | `session_id`, `text` | status |
 | `desktop_key` | `session_id`, `keys` (e.g. `ctrl+c`) | status |
 | `desktop_scroll` | `session_id`, `x`, `y`, `direction`, `amount` | status |
@@ -211,6 +212,33 @@ stay settled**, and returns that frame. Prefer it over `desktop_exec` + manual
 (a browser painting its chrome, then fetching its page) returns the *loaded*
 frame rather than a blank mid-load one — the same hold backs
 `desktop_screenshot_when_settled`.
+
+`desktop_drag` presses at the **current** pointer position and releases at
+`(x, y)`, so call `desktop_move` first to set the start of the drag — the
+target you pass is only where the drag ends.
+
+### Computer-use tips / limitations
+
+The desktop tools drive a real X session, so a few things behave the way a
+physical mouse and keyboard would. Knowing these up front avoids the usual
+surprises:
+
+- **Coordinates are absolute desktop pixels.** `(0, 0)` is the top-left of the
+  whole display, not of any window. Clicking inside a maximized browser means
+  the page viewport starts *below* the browser chrome (roughly the toolbar
+  height), so a coordinate that looks right in the page is off by that offset.
+  Take a `desktop_screenshot` and calibrate against what's actually on screen.
+- **Typing goes to the focused widget.** `desktop_type` / `desktop_key` deliver
+  keystrokes to whatever currently has focus — click the field first. Text typed
+  with no focus target is silently dropped, not buffered.
+- **Typing is one synthetic keystroke at a time.** Fine for form fields and
+  shell commands; slow for very large blobs. To put a big file into the guest,
+  write it with `desktop_exec` (e.g. a here-doc) rather than typing it.
+- **Settle ignores sub-tile pixel noise.** `desktop_what_changed` and the
+  settle logic compare in tiles, so a tiny visual change — a single counter
+  digit ticking, a small checkmark appearing — can read as "nothing changed."
+  Confirm such fine-grained results another way (a screenshot you inspect, or
+  reading state via `desktop_exec`).
 
 ## Security model
 

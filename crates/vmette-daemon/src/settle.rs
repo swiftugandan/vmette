@@ -159,6 +159,13 @@ struct TileState {
     window: VecDeque<bool>,
     /// Count of `true` in `window` (kept in sync to avoid rescans).
     window_changes: u32,
+    /// Polls since this tile last *completed* a clean stable run (reached
+    /// `settle_frames` consecutive unchanged polls). Grows without bound while a
+    /// tile keeps flickering and never holds still long enough to settle; reset
+    /// to 0 the moment it does. This is what distinguishes a region that is
+    /// *actively animating* (forever unstable) from one that simply changed a
+    /// moment ago and is now holding.
+    polls_since_clean: u32,
 }
 
 /// Stateful settle detector for a fixed frame size. Feed frames with
@@ -185,6 +192,7 @@ impl SettleDetector {
                 stable: 0,
                 window: VecDeque::with_capacity(cfg.churn_window as usize),
                 window_changes: 0,
+                polls_since_clean: 0,
             };
             (cols * rows) as usize
         ];
@@ -256,6 +264,15 @@ impl SettleDetector {
                 } else {
                     t.stable += 1;
                 }
+                // Only a clean stable run (held still for `settle_frames`) resets
+                // the unstable clock; every other poll ages it, so an
+                // intermittently-flickering tile that never settles keeps
+                // counting up toward the persistent-animation churn threshold.
+                if !changed && t.stable >= self.cfg.settle_frames {
+                    t.polls_since_clean = 0;
+                } else {
+                    t.polls_since_clean = t.polls_since_clean.saturating_add(1);
+                }
             }
         }
         self.last_damage = damage;
@@ -264,11 +281,31 @@ impl SettleDetector {
         self.verdict(fw, fh)
     }
 
-    /// A tile is *churning* if it changed often across the window AND has not
-    /// yet held a clean stable run — i.e. it is actively animating right now,
-    /// not merely a region that finished changing a moment ago.
+    /// A tile is *churning* if it is **actively animating right now** — it keeps
+    /// changing but never holds a clean stable run, so it can neither be
+    /// included in the settle test nor allowed to block it forever.
+    ///
+    /// Two ways to qualify, both gated on `stable < settle_frames` (a tile that
+    /// just reached a clean run is settling, not churning):
+    ///
+    /// * **High-frequency churn** — it changed at least `churn_threshold` times
+    ///   within the window (obvious video/noise).
+    /// * **Persistent low-frequency animation** — it changed at least once in
+    ///   the window *and* has gone a full window's worth of polls without ever
+    ///   completing a clean stable run. This is the loading-spinner case: its
+    ///   edge tiles flicker too rarely to cross `churn_threshold`, yet too often
+    ///   to ever reach `settle_frames` stable. Without this clause such a tile is
+    ///   neither churning nor quiet, and `verdict` would return `Unsettled`
+    ///   forever. Keying on "has changed at all in the window" (not on a pixel
+    ///   count) keeps a sub-tolerance caret blink — which never registers a tile
+    ///   change — correctly excluded.
     fn is_churning(&self, t: &TileState) -> bool {
-        t.window_changes >= self.cfg.churn_threshold && t.stable < self.cfg.settle_frames
+        if t.stable >= self.cfg.settle_frames {
+            return false;
+        }
+        let high_freq = t.window_changes >= self.cfg.churn_threshold;
+        let persistent = t.window_changes > 0 && t.polls_since_clean >= self.cfg.churn_window;
+        high_freq || persistent
     }
 
     fn verdict(&self, fw: u32, fh: u32) -> SettleState {
@@ -545,6 +582,70 @@ mod tests {
             SettleState::Settled { moving: vec![] },
             "a few-pixel caret blink must not register as motion"
         );
+    }
+
+    /// A small CSS loading spinner: a ~90px region whose changed-pixel pattern
+    /// flickers at a *sub-`churn_threshold`* rate (it only changes every other
+    /// poll, so `window_changes` sits below the high-frequency cutoff) for many
+    /// polls while the rest of the screen is static. The earlier rule classified
+    /// such a tile as neither churning (too few changes) nor settled (never a
+    /// clean stable run), so `verdict` returned `Unsettled` forever. It must now
+    /// settle, reporting the spinner as exactly one moving rect that covers it.
+    #[test]
+    fn small_persistent_animation_settles_as_moving() {
+        let mut d = det();
+        // ~90px spinner, comfortably inside a single 32px-tile neighbourhood but
+        // large enough to clear `tile_pixel_tolerance` when it flickers.
+        let spinner = Rect {
+            x: 320,
+            y: 240,
+            w: 90,
+            h: 90,
+        };
+        let mut rng = Lcg(0x5eed_1234);
+
+        // The spinner is *always present*; only its content advances every third
+        // poll. So the spinner tile changes ~once per three polls (≈3 changes per
+        // 10-poll window — below `churn_threshold = 5`, never high-frequency),
+        // yet it never holds `settle_frames = 3` consecutive unchanged polls.
+        // That is exactly the band that used to wedge `verdict` at Unsettled.
+        // Run far longer than any caller timeout would allow.
+        let mut phase = {
+            // Lay down the initial spinner so the first diff has a baseline.
+            let mut f = Frame::solid(W, H, BG);
+            noise_rect(&mut f, spinner, &mut rng);
+            f
+        };
+        let mut state = d.push(phase.clone());
+        for i in 1..40 {
+            if i % 3 == 0 {
+                // Advance the spinner's pixels (a step of its animation).
+                noise_rect(&mut phase, spinner, &mut rng);
+            }
+            state = d.push(phase.clone());
+        }
+
+        match state {
+            SettleState::Settled { moving } => {
+                assert_eq!(
+                    moving.len(),
+                    1,
+                    "exactly one moving region (the spinner), got {moving:?}"
+                );
+                let m = moving[0];
+                assert!(
+                    m.x <= spinner.x
+                        && m.y <= spinner.y
+                        && m.x + m.w >= spinner.x + spinner.w
+                        && m.y + m.h >= spinner.y + spinner.h,
+                    "moving rect {m:?} must cover spinner {spinner:?}"
+                );
+                assert!(m.w < W && m.h < H, "moving rect must stay local");
+            }
+            other => panic!(
+                "a persistent localized spinner must settle as moving, not block forever; got {other:?}"
+            ),
+        }
     }
 
     /// Whole-screen animation (every tile churning) is never reported settled;

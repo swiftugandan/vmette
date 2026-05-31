@@ -23,6 +23,15 @@ fi
 export DISPLAY=:99
 export HOME="${HOME:-/root}"
 
+# Use the UTF-8 locale generated in the image. vmette boots this rootfs via its
+# own init (chroot from the initramfs), so the Dockerfile's `ENV LANG=…` — which
+# only applies when Docker runs the image — never reaches us. Exporting it here
+# is what actually puts the agent (and the xterm/chromium it launches, which
+# inherit this environment) into UTF-8 mode; without it they run in the C locale
+# and silently drop typed non-ASCII (é, €, …).
+export LANG="${LANG:-en_US.UTF-8}"
+export LC_ALL="${LC_ALL:-en_US.UTF-8}"
+
 # The initramfs carries /dev in as devtmpfs but does not mount devpts; without
 # it terminal emulators (xterm, the agent's `exec` targets) fail to allocate a
 # pty ("get_pty: not enough ptys"). Mount it here as part of desktop bring-up.

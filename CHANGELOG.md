@@ -75,6 +75,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     than the per-action default. Also: `--test-type` added to the desktop
     image's Chromium flags to drop the `--no-sandbox` warning infobar from every
     captured frame.
+  - **`desktop_drag` and `desktop_middle_click` MCP tools.** `desktop_drag`
+    (`session_id`, `x`, `y`) presses at the current pointer position and
+    releases at `(x, y)` — text selection, sliders, drag-and-drop, drawing;
+    pair with `desktop_move` to set the drag start. `desktop_middle_click`
+    (`session_id`, `x`, `y`) joins the existing click family.
   - New [`docs/DESKTOP.md`](docs/DESKTOP.md).
 
 ### Changed
@@ -106,6 +111,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Settle no longer stalls on a small persistent animation.** A spinner or
+  other small, continuously moving region is now treated as a moving region and
+  settle resolves *around* it, rather than that churn keeping the screen from
+  ever reading as settled.
+- **Guest desktop defaults to a UTF-8 locale.** The desktop image now sets a
+  UTF-8 locale, so typing non-ASCII text into terminals works instead of
+  mangling the bytes.
+- **Chromium crash-restore bubble suppressed.** The desktop image suppresses
+  Chromium's "restore pages?" crash-restore bubble, so it no longer covers the
+  first captured frames after a launch.
 - **`desktop_type` corrupted long / multi-line input.** The guest agent's
   string-typing path (`guest/vmette-desktop-agent.c`) bound each distinct
   character to a scratch keycode, but reused the last keycode as a per-keystroke
