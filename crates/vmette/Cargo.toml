@@ -1,6 +1,6 @@
 [package]
 name        = "vmette"
-description = "Local Linux microVM sandbox for macOS, built on Apple's Virtualization.framework"
+description = "Run untrusted agents in a hardware-isolated Linux microVM on macOS — a security boundary built on Apple's Virtualization.framework"
 version     .workspace = true
 edition     .workspace = true
 rust-version.workspace = true

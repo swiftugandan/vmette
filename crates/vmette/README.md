@@ -1,8 +1,15 @@
 # vmette
 
-Local Linux microVM sandbox for macOS, built on Apple's
-`Virtualization.framework` (VZ) via the `objc2-virtualization` bindings. Boots a
-Linux guest in ~1 second.
+**A security boundary for the age of local agents** — run untrusted agents on
+the machines your employees already have, without trusting the agent with the
+machine.
+
+vmette is a headless Linux microVM sandbox for macOS, built on Apple's
+`Virtualization.framework` (VZ) via the `objc2-virtualization` bindings. It
+boots a hardware-isolated Linux guest in ~1 second and gives the agent a real
+machine — shell, filesystem, network — that is *not* your machine: the boundary
+is the hypervisor, and the guest reaches the host filesystem or network only
+where you explicitly grant it.
 
 This crate is the core library. It exposes three faces from one build:
 

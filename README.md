@@ -1,10 +1,46 @@
 # vmette
 
-Local Linux microVM sandbox for macOS, built on Apple's
-`Virtualization.framework`. Ships as a CLI, a Rust library, a C-ABI
-dynamic library, and a long-lived daemon.
+**A security boundary for the age of local agents.** Run untrusted agents on
+the machines your employees already have — without trusting the agent with the
+machine.
 
-- Boots a Linux guest in ~1 second
+vmette is a headless Linux microVM sandbox for macOS, built on Apple's
+`Virtualization.framework`. It boots a hardware-isolated Linux guest in ~1
+second and hands the agent a real machine to work on — a shell, a filesystem, a
+network — that is *not* your machine. The isolation boundary is the hypervisor,
+not a container: the guest cannot reach the host filesystem, your SSH keys, your
+credentials, or your network unless you explicitly grant it.
+
+## The problem
+
+Coding agents and computer-use agents increasingly run untrusted code and take
+untrusted actions. They `pip install` whatever a README names, execute model
+output, follow links, and act on web content that can carry prompt injection.
+Run that straight on a laptop and you've handed the agent — and everything it
+pulls in — the whole machine: your files, your tokens, your network.
+
+The usual answers are a fleet of cloud sandboxes (new infrastructure, new cost,
+added latency, and data leaving the device) or a container (a shared kernel, one
+namespace away from the host). vmette instead puts a fast, disposable,
+hardware-isolated VM on the Mac the employee is already using:
+
+- **Default-deny.** No host filesystem and no network out of the box. The agent
+  gets exactly the directories you share into it and egress only when you turn
+  it on (`--net` / `--allow-network`).
+- **Hypervisor isolation.** The boundary is Apple's Virtualization.framework — a
+  real VM with its own kernel, not a `chroot` or a shared-kernel container.
+- **Ephemeral.** Each run is a fresh guest; an immutable squashfs rootfs keeps
+  the base unmodifiable and content-addressable. Tear it down and nothing
+  persists.
+- **On-device.** No separate fleet to provision, no code or data leaving the
+  laptop, and ~1 s to boot — cheap enough to spin one up per task.
+
+## What you get
+
+A sandbox that ships as a CLI, a Rust library, a C-ABI dynamic library, a
+long-lived daemon, and an MCP server for agent hosts.
+
+- Boots a hardware-isolated Linux guest in ~1 second
 - **Pluggable rootfs providers**: local directories, OCI/Docker images
   (`alpine:3.20`, `ghcr.io/...`, public or private), tarballs over
   HTTP/HTTPS/file, or prebuilt squashfs block images — dispatched
@@ -15,8 +51,9 @@ dynamic library, and a long-lived daemon.
   and shareable across sessions (`--rootfs squashfs+…`).
 - **Private registry auth** for the OCI provider via env vars or
   `~/.docker/config.json` (`VMETTE_OCI_TOKEN`).
-- virtio-fs for sharing host dirs, virtio-net (NAT), virtio-blk,
-  vsock with bidirectional bytes
+- **Grant, don't expose**: virtio-fs shares only the host dirs you name,
+  virtio-net (NAT) is off until you ask, plus virtio-blk and bidirectional
+  vsock
 - Exit-code propagation, timeout, switch-root, read-only rootfs share
 - Universal binary (x86_64 + arm64)
 - ~440 KB host binary, 25 KB guest helpers
@@ -201,8 +238,10 @@ See [`docs/DAEMON.md`](docs/DAEMON.md).
 any MCP-aware agent host — Claude Desktop, Cursor, Cline, Zed, Goose,
 etc. It ships an `execute` tool, `fetch_url`, a `workspace_*` family
 (each call boots a fresh microVM), and a `desktop_*` family for
-computer use. The agent never touches your real filesystem unless you
-explicitly shared a directory into it.
+computer use. This is the agent's whole world: it runs inside the VM, so
+it never touches your real filesystem unless you explicitly share a
+directory into it, and it has no network egress unless you start the
+server with `--allow-network`.
 
 See [`docs/MCP.md`](docs/MCP.md) for the full tool reference, security
 model, and client configs.
