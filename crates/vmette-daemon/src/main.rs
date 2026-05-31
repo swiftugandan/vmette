@@ -38,6 +38,7 @@
 //!   --vmette  $(dirname argv[0])/vmette  (falls back to PATH lookup)
 
 mod registry;
+mod settle;
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -46,14 +47,20 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use base64::Engine as _;
-use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::Command;
 use tokio::signal::unix::{signal, SignalKind};
 use tracing::{error, info, warn};
+use vmette_proto::daemon::{
+    ActionReply, ChangedReply, DesktopReply, DesktopRequest, ErrorReply, Frame, Request,
+    SessionReply, SettleReply,
+};
 
-use registry::{Registry, StartParams, DEFAULT_DESKTOP_IMAGE};
+use registry::{
+    Registry, StartParams, DEFAULT_DESKTOP_IMAGE, DEFAULT_DESKTOP_MEM_MIB, DEFAULT_DESKTOP_VCPUS,
+    DEFAULT_SETTLE_TIMEOUT_MS,
+};
 
 /// How many concurrent desktop VMs the daemon will host. Each is a ~2 GB VM.
 const MAX_DESKTOP_SESSIONS: usize = 8;
@@ -62,192 +69,9 @@ const DESKTOP_IDLE_TTL: Duration = Duration::from_secs(30 * 60);
 /// How often the background sweeper checks for idle sessions.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
-#[derive(Debug, Deserialize)]
-struct Request {
-    kernel: PathBuf,
-    initramfs: PathBuf,
-    /// Rootfs spec dispatched through the CLI's provider registry.
-    /// See `vmette providers` for valid forms (path, image ref, tar+...).
-    rootfs: String,
-    #[serde(default)]
-    rootfs_ro: bool,
-    #[serde(default)]
-    offline: bool,
-    #[serde(default)]
-    shares: Vec<ShareMount>,
-    #[serde(default)]
-    disks: Vec<PathBuf>,
-    exec: String,
-    #[serde(default)]
-    net: bool,
-    #[serde(default)]
-    switch_root: bool,
-    /// -1 disable, 0 auto, >0 fixed
-    #[serde(default)]
-    vsock_port: i32,
-    #[serde(default = "default_guest_vsock_port")]
-    guest_vsock_port: u32,
-    #[serde(default)]
-    timeout_seconds: Option<u32>,
-    #[serde(default = "default_vcpus")]
-    vcpus: u8,
-    #[serde(default = "default_mem_mib")]
-    mem_mib: u64,
-}
-
-fn default_guest_vsock_port() -> u32 {
-    1025
-}
-fn default_vcpus() -> u8 {
-    1
-}
-fn default_mem_mib() -> u64 {
-    512
-}
-
-#[derive(Debug, Deserialize)]
-struct ShareMount {
-    tag: String,
-    path: PathBuf,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(tag = "kind", rename_all = "lowercase")]
-enum Frame {
-    Stdout { data: String },
-    Stderr { data: String },
-    Exit { code: i32 },
-    Error { message: String },
-}
-
-// ---- desktop session protocol (stateful path) ---------------------------
-
-/// `kind: "desktop_start"` — boot a persistent desktop VM. The kernel +
-/// initramfs are the ordinary vmette assets; desktop-ness comes from `image`
-/// + the Agent workload.
-#[derive(Debug, Deserialize)]
-struct DesktopStartReq {
-    kernel: PathBuf,
-    initramfs: PathBuf,
-    #[serde(default = "default_desktop_image")]
-    image: String,
-    /// "WIDTHxHEIGHT"; defaults to 1280x800 when absent/unparseable.
-    #[serde(default)]
-    size: Option<String>,
-    #[serde(default)]
-    net: bool,
-    #[serde(default)]
-    offline: bool,
-    #[serde(default = "default_desktop_vcpus")]
-    vcpus: u8,
-    #[serde(default = "default_desktop_mem_mib")]
-    mem_mib: u64,
-}
-
-/// `kind: "desktop_action"` — one computer-use action against a live session.
-#[derive(Debug, Deserialize)]
-struct DesktopActionReq {
-    session_id: String,
-    action: vmette::Action,
-}
-
-/// `kind: "desktop_screenshot_settled"` — poll until the desktop stops changing,
-/// then return that frame plus the regions still moving.
-#[derive(Debug, Deserialize)]
-struct DesktopSettleReq {
-    session_id: String,
-    /// Max time to wait for the screen to settle before returning the latest
-    /// frame anyway (with `settled: false`). Defaults to 10s.
-    #[serde(default = "default_settle_timeout_ms")]
-    timeout_ms: u64,
-}
-
-/// `kind: "desktop_what_changed"` — capture one frame and report what moved
-/// since this session's previous capture.
-#[derive(Debug, Deserialize)]
-struct DesktopWhatChangedReq {
-    session_id: String,
-}
-
-/// `kind: "desktop_stop"` — tear a live session down.
-#[derive(Debug, Deserialize)]
-struct DesktopStopReq {
-    session_id: String,
-}
-
-fn default_settle_timeout_ms() -> u64 {
-    10_000
-}
-
-fn default_desktop_image() -> String {
-    DEFAULT_DESKTOP_IMAGE.to_string()
-}
-fn default_desktop_vcpus() -> u8 {
-    2
-}
-fn default_desktop_mem_mib() -> u64 {
-    2048
-}
-
-/// A rectangle on the wire (pixel coords). Mirror of [`vmette::settle::Rect`],
-/// which is intentionally not `Serialize` (the core stays serde-free).
-#[derive(Debug, Serialize)]
-struct RectJson {
-    x: u32,
-    y: u32,
-    w: u32,
-    h: u32,
-}
-
-impl From<vmette::settle::Rect> for RectJson {
-    fn from(r: vmette::settle::Rect) -> Self {
-        Self {
-            x: r.x,
-            y: r.y,
-            w: r.w,
-            h: r.h,
-        }
-    }
-}
-
-/// Single-line JSON reply for the desktop kinds.
-#[derive(Debug, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum DesktopReply {
-    Session {
-        session_id: String,
-    },
-    ActionResult {
-        ok: bool,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        error: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        x: Option<i32>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        y: Option<i32>,
-        /// Base64 PNG for `screenshot`; absent otherwise.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        png_base64: Option<String>,
-    },
-    /// Reply for `desktop_screenshot_settled`: the captured frame, whether it
-    /// actually settled (vs. timed out), and the regions still moving.
-    Settled {
-        settled: bool,
-        moving: Vec<RectJson>,
-        png_base64: String,
-    },
-    /// Reply for `desktop_what_changed`: a fresh frame and the damage box
-    /// (absent when nothing changed since the previous capture).
-    Changed {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        changed: Option<RectJson>,
-        png_base64: String,
-    },
-    Stopped,
-    Error {
-        message: String,
-    },
-}
+// The run + desktop protocol *types* live in `vmette-proto` (imported above);
+// the desktop-session defaults the dispatch applies to an unset field are owned
+// by the `registry` module (imported above) alongside `DEFAULT_DESKTOP_IMAGE`.
 
 /// Parse "WIDTHxHEIGHT" → (w, h); default 1280x800 on absence/parse error.
 fn parse_size(s: Option<&str>) -> (u32, u32) {
@@ -385,84 +209,80 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Per-connection entry point. Reads the single request line, peeks its
-/// `kind`, and routes: desktop kinds to the stateful session registry,
-/// everything else (no kind / `"run"`) to the stateless subprocess path.
+/// Per-connection entry point. Reads the single request line, peeks whether it
+/// carries a `desktop_*` kind, and routes: desktop requests to the stateful
+/// session registry, everything else (the untagged run [`Request`]) to the
+/// stateless subprocess path.
 async fn dispatch(stream: UnixStream, vmette_bin: PathBuf, registry: Arc<Registry>) -> Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
     let mut line = String::new();
     reader.read_line(&mut line).await?;
-    let line = line.trim().to_string();
+    let line = line.trim();
 
-    // Peek the kind without committing to a concrete request shape.
-    let kind = serde_json::from_str::<serde_json::Value>(&line)
+    // Peek only enough to route: a `desktop_*` kind is the stateful path; the
+    // untagged run request is everything else. The concrete shape is parsed by
+    // the chosen handler against its typed `vmette-proto` enum/struct.
+    let is_desktop = serde_json::from_str::<serde_json::Value>(line)
         .ok()
-        .and_then(|v| v.get("kind").and_then(|k| k.as_str()).map(str::to_owned));
+        .and_then(|v| v.get("kind").and_then(|k| k.as_str()).map(str::to_owned))
+        .is_some_and(|k| k.starts_with("desktop_"));
 
-    match kind.as_deref() {
-        Some("desktop_start")
-        | Some("desktop_action")
-        | Some("desktop_screenshot_settled")
-        | Some("desktop_what_changed")
-        | Some("desktop_stop") => {
-            let reply = handle_desktop(kind.as_deref().unwrap(), &line, registry).await;
-            let mut json = serde_json::to_vec(&reply)?;
-            json.push(b'\n');
-            let _ = write_half.write_all(&json).await;
-            let _ = write_half.shutdown().await;
-            Ok(())
-        }
-        // None (legacy untagged) or explicit "run": stateless subprocess path.
-        _ => {
-            let req: Request = serde_json::from_str(&line).context("parse run request")?;
-            run_workload(req, write_half, vmette_bin).await
-        }
+    if is_desktop {
+        let reply = handle_desktop(line, registry).await;
+        let mut json = serde_json::to_vec(&reply)?;
+        json.push(b'\n');
+        let _ = write_half.write_all(&json).await;
+        let _ = write_half.shutdown().await;
+        Ok(())
+    } else {
+        let req: Request = serde_json::from_str(line).context("parse run request")?;
+        run_workload(req, write_half, vmette_bin).await
     }
 }
 
 /// Route a parsed desktop request to the registry, mapping results/errors to a
 /// single [`DesktopReply`]. Blocking registry calls hop off the async thread
 /// via `spawn_blocking`.
-async fn handle_desktop(kind: &str, line: &str, registry: Arc<Registry>) -> DesktopReply {
-    match desktop_result(kind, line, registry).await {
+async fn handle_desktop(line: &str, registry: Arc<Registry>) -> DesktopReply {
+    match desktop_result(line, registry).await {
         Ok(reply) => reply,
-        Err(e) => DesktopReply::Error {
+        Err(e) => DesktopReply::Error(ErrorReply {
             message: format!("{e:#}"),
-        },
+        }),
     }
 }
 
-async fn desktop_result(kind: &str, line: &str, registry: Arc<Registry>) -> Result<DesktopReply> {
-    match kind {
-        "desktop_start" => {
-            let req: DesktopStartReq = serde_json::from_str(line).context("parse desktop_start")?;
+async fn desktop_result(line: &str, registry: Arc<Registry>) -> Result<DesktopReply> {
+    let req: DesktopRequest = serde_json::from_str(line).context("parse desktop request")?;
+    match req {
+        DesktopRequest::DesktopStart(req) => {
             let (width, height) = parse_size(req.size.as_deref());
             let params = StartParams {
                 kernel: req.kernel,
                 initramfs: req.initramfs,
-                image: req.image,
+                image: req
+                    .image
+                    .unwrap_or_else(|| DEFAULT_DESKTOP_IMAGE.to_string()),
                 width,
                 height,
                 net: req.net,
                 offline: req.offline,
-                vcpus: req.vcpus,
-                mem_mib: req.mem_mib,
+                vcpus: req.vcpus.unwrap_or(DEFAULT_DESKTOP_VCPUS),
+                mem_mib: req.mem_mib.unwrap_or(DEFAULT_DESKTOP_MEM_MIB),
             };
             let session_id = tokio::task::spawn_blocking(move || registry.start(params))
                 .await
                 .context("session start task")??;
-            Ok(DesktopReply::Session { session_id })
+            Ok(DesktopReply::Session(SessionReply { session_id }))
         }
-        "desktop_action" => {
-            let req: DesktopActionReq =
-                serde_json::from_str(line).context("parse desktop_action")?;
+        DesktopRequest::DesktopAction(req) => {
             let res =
                 tokio::task::spawn_blocking(move || registry.action(&req.session_id, &req.action))
                     .await
                     .context("session action task")??;
-            Ok(DesktopReply::ActionResult {
+            Ok(DesktopReply::ActionResult(ActionReply {
                 ok: res.ok,
                 error: res.error,
                 x: res.x,
@@ -470,42 +290,37 @@ async fn desktop_result(kind: &str, line: &str, registry: Arc<Registry>) -> Resu
                 png_base64: res
                     .png
                     .map(|b| base64::engine::general_purpose::STANDARD.encode(b)),
-            })
+            }))
         }
-        "desktop_screenshot_settled" => {
-            let req: DesktopSettleReq =
-                serde_json::from_str(line).context("parse desktop_screenshot_settled")?;
-            let timeout = Duration::from_millis(req.timeout_ms);
+        DesktopRequest::DesktopScreenshotSettled(req) => {
+            let timeout =
+                Duration::from_millis(req.timeout_ms.unwrap_or(DEFAULT_SETTLE_TIMEOUT_MS));
             let res = tokio::task::spawn_blocking(move || {
                 registry.screenshot_when_settled(&req.session_id, timeout)
             })
             .await
             .context("settle poll task")??;
-            Ok(DesktopReply::Settled {
+            Ok(DesktopReply::Settled(SettleReply {
                 settled: res.settled,
-                moving: res.moving.into_iter().map(RectJson::from).collect(),
+                moving: res.moving,
                 png_base64: base64::engine::general_purpose::STANDARD.encode(res.png),
-            })
+            }))
         }
-        "desktop_what_changed" => {
-            let req: DesktopWhatChangedReq =
-                serde_json::from_str(line).context("parse desktop_what_changed")?;
+        DesktopRequest::DesktopWhatChanged(req) => {
             let res = tokio::task::spawn_blocking(move || registry.what_changed(&req.session_id))
                 .await
                 .context("what_changed task")??;
-            Ok(DesktopReply::Changed {
-                changed: res.changed.map(RectJson::from),
+            Ok(DesktopReply::Changed(ChangedReply {
+                changed: res.changed,
                 png_base64: base64::engine::general_purpose::STANDARD.encode(res.png),
-            })
+            }))
         }
-        "desktop_stop" => {
-            let req: DesktopStopReq = serde_json::from_str(line).context("parse desktop_stop")?;
+        DesktopRequest::DesktopStop(req) => {
             tokio::task::spawn_blocking(move || registry.stop(&req.session_id))
                 .await
                 .context("session stop task")??;
             Ok(DesktopReply::Stopped)
         }
-        other => Err(anyhow!("unknown desktop kind: {other}")),
     }
 }
 

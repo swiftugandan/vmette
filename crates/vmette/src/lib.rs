@@ -23,12 +23,15 @@ mod vz;
 pub mod desktop;
 pub mod ffi;
 pub mod provider;
-pub mod settle;
 
 pub use desktop::{Action, ResponseHeader, ScrollDirection};
 pub use lifecycle::{run, RunOutput};
 pub use provider::{BlockFs, RootfsArtifact};
 pub use session::{Session, SessionClient, SessionEnd, StopHandle};
+/// The one workspace-wide host-directory share descriptor, owned by
+/// `vmette-proto` so the daemon's run protocol and this config API share a
+/// single type. Re-exported here as part of the core's public surface.
+pub use vmette_proto::ShareMount;
 
 /// Selects what the guest does once booted, and therefore which terminal
 /// event ends the [`Session`].
@@ -65,13 +68,6 @@ pub enum VsockPort {
 pub struct RootfsShare {
     pub path: PathBuf,
     pub read_only: bool,
-}
-
-/// Extra host directory mounted at `/mnt/<tag>` in the guest.
-#[derive(Debug, Clone)]
-pub struct ShareMount {
-    pub tag: String,
-    pub path: PathBuf,
 }
 
 /// A filesystem image attached as virtio-blk slot 0 (`/dev/vda`) and

@@ -1,19 +1,19 @@
 //! Tile-based **pixel-settle detection** for the desktop perception layer.
 //!
 //! An agent drives the Agent-workload desktop purely through screenshots
-//! ([`crate::desktop::Action::Screenshot`]). After it acts, we want to hand it
-//! the screen once it has *settled* (stopped changing) — but a playing video or
-//! a blinking caret means the framebuffer never globally quiesces, so a naive
-//! "is this frame identical to the last?" check either fires too early or never
-//! fires. This module decides settle from the pixels alone and, crucially,
-//! reports the regions that are *still* moving so the model can reason about
-//! them instead of being blocked by them.
+//! (`vmette::Action::Screenshot`). After it acts, we want to hand it the screen
+//! once it has *settled* (stopped changing) — but a playing video or a blinking
+//! caret means the framebuffer never globally quiesces, so a naive "is this
+//! frame identical to the last?" check either fires too early or never fires.
+//! This module decides settle from the pixels alone and, crucially, reports the
+//! regions that are *still* moving so the model can reason about them instead of
+//! being blocked by them.
 //!
-//! Like [`crate::desktop`], this module is **pure** — no VZ, no objc2, no I/O.
-//! It is plain pixel math over decoded frames, unit-testable against synthetic
-//! sequences. The host-side orchestration (poll the agent, decode each PNG,
-//! feed it here, stop when settled) lives a layer up in the daemon's session
-//! registry; this is only the algorithm.
+//! This is the daemon's perception logic: its only consumer is the session
+//! registry (poll the agent, decode each PNG, feed it here, stop when settled).
+//! It is **pure** — no VZ, no objc2, no I/O — plain pixel math over decoded
+//! frames, unit-testable against synthetic sequences. The pixel-rectangle type
+//! it reports ([`Rect`]) is the shared wire type from `vmette-proto`.
 //!
 //! ## Design (distilled from prior art)
 //!
@@ -33,6 +33,8 @@
 //!   back as "still moving here" rectangles (the agent's video/animation hint).
 
 use std::collections::VecDeque;
+
+use vmette_proto::Rect;
 
 /// A decoded framebuffer. `pixels.len() == width * height * channels`.
 /// `channels` is 3 (RGB) or 4 (RGBA); only the first three (RGB) are compared,
@@ -59,7 +61,8 @@ impl Frame {
         }
     }
 
-    /// A `width`×`height` RGBA frame filled with a solid color (tests/fixtures).
+    /// A `width`×`height` RGBA frame filled with a solid color (test fixtures).
+    #[cfg(test)]
     pub fn solid(width: u32, height: u32, rgba: [u8; 4]) -> Self {
         let mut pixels = Vec::with_capacity((width * height * 4) as usize);
         for _ in 0..width * height {
@@ -74,7 +77,8 @@ impl Frame {
     }
 
     /// Paint a filled rectangle (clipped to bounds). Writes `channels` bytes
-    /// per pixel from `rgba` (alpha dropped for 3-channel frames).
+    /// per pixel from `rgba` (alpha dropped for 3-channel frames). Test fixture.
+    #[cfg(test)]
     pub fn fill_rect(&mut self, rect: Rect, rgba: [u8; 4]) {
         let ch = self.channels as usize;
         let x2 = (rect.x + rect.w).min(self.width);
@@ -93,15 +97,6 @@ impl Frame {
         let i = ((y * self.width + x) as usize) * self.channels as usize;
         [self.pixels[i], self.pixels[i + 1], self.pixels[i + 2]]
     }
-}
-
-/// A rectangle in pixel coordinates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Rect {
-    pub x: u32,
-    pub y: u32,
-    pub w: u32,
-    pub h: u32,
 }
 
 /// Tunables for [`SettleDetector`]. Defaults mirror the prior-art numbers

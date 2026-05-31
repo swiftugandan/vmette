@@ -44,12 +44,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use rand::Rng;
-use vmette::provider::{Context, DirProvider, Registry as ProviderRegistry};
-use vmette::settle::{Frame, Rect, SettleConfig, SettleDetector, SettleState};
+use vmette::provider::Context;
 use vmette::{Action, Config, Session, SessionClient, SessionEnd, StopHandle};
-use vmette_provider_oci::OciProvider;
-use vmette_provider_squashfs::SquashfsProvider;
-use vmette_provider_tar::TarProvider;
+use vmette_proto::Rect;
+
+use crate::settle::{Frame, SettleConfig, SettleDetector, SettleState};
 
 /// How often the settle poll re-captures the screen. Needs to be long enough
 /// that a playing video actually changes between polls (so churn is detected),
@@ -59,6 +58,12 @@ const SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(120);
 /// Default OCI ref for the desktop rootfs image, baked in the same way the
 /// MCP/CLI default `python:3.12-alpine` etc. Overridable per `start` request.
 pub const DEFAULT_DESKTOP_IMAGE: &str = "ghcr.io/chamuka-inc/vmette-desktop:latest";
+/// Default vCPUs for a desktop session when the request omits `vcpus`.
+pub const DEFAULT_DESKTOP_VCPUS: u8 = 2;
+/// Default RAM (MiB) for a desktop session when the request omits `mem_mib`.
+pub const DEFAULT_DESKTOP_MEM_MIB: u64 = 2048;
+/// Default settle-poll timeout when `desktop_screenshot_settled` omits it.
+pub const DEFAULT_SETTLE_TIMEOUT_MS: u64 = 10_000;
 
 /// A live desktop session's host-side handles. The `Session` itself lives on
 /// `thread`; we keep only the `Send` control handles here.
@@ -168,13 +173,9 @@ impl Registry {
             }
         };
 
-        // Resolve the rootfs image to a directory via the provider registry,
-        // exactly as the CLI does for --rootfs.
-        let provider = ProviderRegistry::new()
-            .with(DirProvider::new())
-            .with(SquashfsProvider::new())
-            .with(TarProvider::new())
-            .with(OciProvider::new());
+        // Resolve the rootfs image to a directory via the shared provider
+        // registry, exactly as the CLI does for --rootfs.
+        let provider = vmette_providers::default_registry();
         let ctx = Context::new(self.cache_root.clone())
             .offline(params.offline)
             .guest_helpers_dir(self.guest_helpers_dir.clone());

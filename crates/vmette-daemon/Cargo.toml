@@ -12,17 +12,16 @@ path = "src/main.rs"
 
 [dependencies]
 tokio       = { version = "1", features = ["full"] }
-serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
 tracing     = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 anyhow      = "1"
 # In-process desktop sessions: the daemon hosts live vmette::Session VMs
-# (Agent workload) and resolves their rootfs images via the provider crates.
-vmette                   = { path = "../vmette" }
-vmette-provider-oci      = { path = "../vmette-provider-oci" }
-vmette-provider-squashfs = { path = "../vmette-provider-squashfs" }
-vmette-provider-tar      = { path = "../vmette-provider-tar" }
+# (Agent workload) and resolves their rootfs images via the shared provider
+# registry. The socket wire types come from vmette-proto.
+vmette            = { path = "../vmette" }
+vmette-proto      = { path = "../vmette-proto" }
+vmette-providers  = { path = "../vmette-providers" }
 base64      = "0.22"
 rand        = "0.8"
 # Decode the agent's screenshot PNGs into raw pixels for the host-side

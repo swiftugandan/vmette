@@ -13,6 +13,7 @@ repository  .workspace = true
 crate-type = ["lib", "cdylib", "staticlib"]
 
 [dependencies]
+vmette-proto         = { path = "../vmette-proto" }
 objc2                .workspace = true
 objc2-core-foundation .workspace = true
 objc2-foundation     .workspace = true
