@@ -57,7 +57,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **MCP**: `desktop_*` tools routed through the daemon;
     `desktop_screenshot` returns an MCP image content block. The
     `execute` / `workspace_*` tools keep their direct-subprocess path.
+  - **`desktop_launch` MCP tool.** Application-agnostic "start a GUI app and
+    return its first painted frame": backgrounds the command (stdio → guest
+    log so a chatty app can't block before painting), waits for the screen to
+    change and then settle, and returns that frame. Carries no app-specific
+    knowledge — the software-GL browser flags live in the desktop image
+    (`/etc/chromium.d/`), so a bare `chromium <url>` renders.
   - New [`docs/DESKTOP.md`](docs/DESKTOP.md).
+
+### Changed
+
+- **Single owner per wire contract (internal restructure).** Extracted a new
+  leaf crate **`vmette-proto`** (serde only) that owns every cross-crate wire
+  shape: the guest computer-use vocabulary (`Action`, `ResponseHeader`,
+  `ScrollDirection`), the `vmetted` UNIX-socket protocol (the run
+  `Request`/`Frame` and the desktop `DesktopRequest`/`DesktopReply` tagged
+  enums), `Rect`, and `ShareMount`. The daemon, MCP server, and CLI all build
+  and parse these as the *same* Rust types — the hand-rolled `json!()` desktop
+  clients and the triplicated rectangle type are gone, so a renamed field or new
+  `kind` is now a compile error rather than a silent runtime break. The socket
+  bytes are unchanged.
+- **Provider order has one home.** New **`vmette-providers`** crate exposes
+  `default_registry()` (DirProvider→Squashfs→Tar→Oci); the CLI and the daemon's
+  desktop registry both call it instead of each hand-building the load-bearing,
+  first-match-wins order.
+- **Core trimmed to VZ mechanism.** The pixel-`settle` perception module moved
+  out of the "lean" core (`crates/vmette`) into `vmette-daemon`, its only
+  consumer; core `vmette` is now VZ + `Session` plus a thin re-export of the
+  proto types.
 
 ## [0.1.0] — 2026-05-29
 

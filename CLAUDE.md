@@ -21,13 +21,16 @@ binary and macOS.
 
 ## Workspace layout
 
-Seven crates (workspace `version = 0.1.0`, edition 2021, `rust-version = 1.80`, MIT):
+Ten crates (workspace `version = 0.1.0`, edition 2021, `rust-version = 1.80`, MIT):
 
 | Crate | Purpose |
 |-------|---------|
-| `crates/vmette` | Core library (lib + cdylib + staticlib). VZ wrapper; `Config`, `run()`, `Session`, providers, C ABI. |
+| `crates/vmette` | Core library (lib + cdylib + staticlib). VZ wrapper + `Session` only; `Config`, `run()`, providers, C ABI. Depends on `vmette-proto`. |
+| `crates/vmette-proto` | **Leaf** (serde only, no workspace deps). The wire contracts: `agent::{Action, ResponseHeader, ScrollDirection}` (guest vsock), `daemon::{Request, Frame, DesktopRequest, DesktopReply, …}` (vmetted socket), `geom::Rect`, `ShareMount`. One Rust type per wire shape → drift is a compile error. |
+| `crates/vmette-providers` | Aggregator exposing `default_registry()` (DirProvider→Squashfs→Tar→Oci, the single load-bearing order). Used by the CLI + daemon so both resolve specs identically. |
+| `crates/vmette-assets` | Shared boot-asset (kernel + initramfs) discovery for the binaries. |
 | `crates/vmette-cli` | `vmette` CLI binary. Hand-rolled arg parsing (no clap — keeps the binary small). |
-| `crates/vmette-daemon` | `vmetted` — UNIX-socket dispatcher (tokio). Stateless subprocess dispatch + stateful desktop registry. |
+| `crates/vmette-daemon` | `vmetted` — UNIX-socket dispatcher (tokio). Stateless subprocess dispatch + stateful desktop registry; owns the pixel-`settle` perception module. |
 | `crates/vmette-mcp` | MCP server (`vmette-mcp`) exposing vmette to AI agents over stdio. |
 | `crates/vmette-provider-oci` | OCI/Docker image rootfs provider (catch-all for bare refs + `oci://`); per-registry `AuthResolver` for private images. |
 | `crates/vmette-provider-squashfs` | Squashfs block-image rootfs provider (`squashfs+file://`, `squashfs+https://`, `squashfs+http://`). Returns `BlockImage`. |
@@ -52,9 +55,11 @@ Seven crates (workspace `version = 0.1.0`, edition 2021, `rust-version = 1.80`, 
   read-only block device) + `Registry` dispatcher + `Context` (cache root,
   offline flag, optional guest-helpers dir). Built-in `DirProvider`;
   OCI/tar/squashfs live in sibling crates.
-- **`desktop.rs`** — framed vsock protocol `[u32 LE header_len][JSON header][optional binary payload]`,
-  the `Action` enum (screenshot/clicks/type/key/scroll/… mirroring Anthropic
-  computer use) and `ResponseHeader`. Pure types — no VZ/objc2.
+- **`desktop.rs`** — the framed vsock **codec** `[u32 LE header_len][JSON header][optional binary payload]`
+  (pure, no VZ/objc2). The `Action`/`ResponseHeader`/`ScrollDirection` *types*
+  it carries live in `vmette-proto` and are re-exported here (and as
+  `vmette::Action` etc.). The pixel-settle perception module is **not** here —
+  it moved to the daemon, its only consumer.
 - **`cmdline.rs`** — assembles the kernel cmdline, emitting `vmette.*=…` tokens
   (exec base64, rootfs, `rootfs_block=squashfs` + auto `ctl` control share for
   block images, shares, net, vsock_port, switch_root, snapshot mode,
@@ -76,19 +81,30 @@ Seven crates (workspace `version = 0.1.0`, edition 2021, `rust-version = 1.80`, 
 Two **deliberately separate** subsystems:
 
 - **Stateless dispatch** (`main.rs`): the existing per-request path forks a
-  `vmette` subprocess and streams stdout/stderr/exit back over the socket.
+  `vmette` subprocess and streams stdout/stderr/exit back over the socket. It
+  peeks `kind`: a `desktop_*` request deserializes into the typed
+  `vmette_proto::daemon::DesktopRequest` enum and is matched (no stringly second
+  dispatch); everything else is the untagged run `Request`.
 - **Stateful desktop registry** (`registry.rs`): holds live `vmette::Session`
   VMs (Agent workload) in-process so a desktop persists across many requests.
-  Guardrails: max-live cap (8), idle eviction (30 min), background sweep (60 s).
-  Each session on its own thread; VM-control hops off the async runtime via
-  `spawn_blocking`. Keep statefulness contained here — do **not** interleave it
-  into the clean dispatch path.
+  Resolves rootfs images via `vmette_providers::default_registry()`. Guardrails:
+  max-live cap (8), idle eviction (30 min), background sweep (60 s). Each session
+  on its own thread; VM-control hops off the async runtime via `spawn_blocking`.
+  Keep statefulness contained here — do **not** interleave it into the clean
+  dispatch path.
+- **`settle.rs`**: tile-based pixel-settle detection (distilled from
+  x11vnc/TurboVNC/Playwright/pixelmatch). Pure pixel math, no VZ/objc2; the
+  registry feeds it decoded screenshot frames to decide when the screen has
+  quiesced and which regions are still moving. Lives here because the daemon is
+  its only consumer (`Rect` comes from `vmette-proto`).
 
 ## MCP server — `crates/vmette-mcp/src/`
 
 `server.rs` registers tools: `execute`, `fetch_url`, `workspace_*` (direct
 subprocess path), and `desktop_*` (routed through `vmetted` via
-`daemon_client.rs`, since persistence requires the daemon). `desktop_screenshot`
+`daemon_client.rs`, since persistence requires the daemon). `daemon_client.rs`
+builds requests and parses replies as `vmette-proto` types (no hand-rolled
+`json!`), so a protocol change is a compile error here. `desktop_screenshot`
 returns an MCP image content block. `--allow-network` gates outbound network.
 
 ## Assets, guest, scripts
