@@ -1,0 +1,17 @@
+[package]
+name        = "vmette-proto"
+description = "Wire contracts shared across the vmette workspace: the guest computer-use vocabulary and the vmetted UNIX-socket protocol"
+version     .workspace = true
+edition     .workspace = true
+license     .workspace = true
+repository  .workspace = true
+
+[lib]
+name = "vmette_proto"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

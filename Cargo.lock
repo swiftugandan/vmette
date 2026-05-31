@@ -2667,6 +2667,7 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "tracing",
+ "vmette-proto",
 ]
 
 [[package]]
@@ -2682,9 +2683,8 @@ dependencies = [
  "tracing-subscriber",
  "vmette",
  "vmette-assets",
- "vmette-provider-oci",
- "vmette-provider-squashfs",
- "vmette-provider-tar",
+ "vmette-proto",
+ "vmette-providers",
 ]
 
 [[package]]
@@ -2695,15 +2695,13 @@ dependencies = [
  "base64",
  "png",
  "rand 0.8.6",
- "serde",
  "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
  "vmette",
- "vmette-provider-oci",
- "vmette-provider-squashfs",
- "vmette-provider-tar",
+ "vmette-proto",
+ "vmette-providers",
 ]
 
 [[package]]
@@ -2724,6 +2722,15 @@ dependencies = [
  "url",
  "uuid",
  "vmette-assets",
+ "vmette-proto",
+]
+
+[[package]]
+name = "vmette-proto"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2763,6 +2770,16 @@ dependencies = [
  "ureq",
  "vmette",
  "zstd",
+]
+
+[[package]]
+name = "vmette-providers"
+version = "0.1.0"
+dependencies = [
+ "vmette",
+ "vmette-provider-oci",
+ "vmette-provider-squashfs",
+ "vmette-provider-tar",
 ]
 
 [[package]]
