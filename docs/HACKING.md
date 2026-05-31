@@ -18,10 +18,13 @@
 ```sh
 make build                  # cargo build --release + codesign vmette
 make assets init guest-bin  # pull alpine kernel/initramfs/rootfs + repack
+make desktop-image          # build the desktop rootfs from source → assets/ (needs Docker)
 make test                   # cargo tests + end-to-end VM smoke
 ```
 
 `make run 'echo hi'` runs a one-shot guest with sensible defaults.
+`make desktop-image` exports the computer-use rootfs to
+`assets/vmette-desktop-rootfs.tar`, which the CLI/MCP auto-discover.
 
 ## Layout reminder
 

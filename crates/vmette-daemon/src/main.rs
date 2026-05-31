@@ -57,8 +57,8 @@ use vmette_proto::daemon::{
 };
 
 use registry::{
-    Registry, StartParams, DEFAULT_DESKTOP_IMAGE, DEFAULT_DESKTOP_MEM_MIB, DEFAULT_DESKTOP_VCPUS,
-    DEFAULT_SETTLE_HOLD_MS, DEFAULT_SETTLE_TIMEOUT_MS,
+    Registry, StartParams, DEFAULT_DESKTOP_MEM_MIB, DEFAULT_DESKTOP_VCPUS, DEFAULT_SETTLE_HOLD_MS,
+    DEFAULT_SETTLE_TIMEOUT_MS,
 };
 
 /// How many concurrent desktop VMs the daemon will host. Each is a ~2 GB VM.
@@ -69,8 +69,9 @@ const DESKTOP_IDLE_TTL: Duration = Duration::from_secs(30 * 60);
 const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
 // The run + desktop protocol *types* live in `vmette-proto` (imported above);
-// the desktop-session defaults the dispatch applies to an unset field are owned
-// by the `registry` module (imported above) alongside `DEFAULT_DESKTOP_IMAGE`.
+// the desktop-session defaults the dispatch applies to unset fields (`vcpus`,
+// `mem_mib`, `size`) are owned by the `registry` module (imported above). The
+// `image` is resolved client-side, so the dispatch passes it through verbatim.
 
 /// Parse "WIDTHxHEIGHT" → (w, h); default 1280x800 on absence/parse error.
 fn parse_size(s: Option<&str>) -> (u32, u32) {
@@ -261,9 +262,7 @@ async fn desktop_result(line: &str, registry: Arc<Registry>) -> Result<DesktopRe
             let params = StartParams {
                 kernel: req.kernel,
                 initramfs: req.initramfs,
-                image: req
-                    .image
-                    .unwrap_or_else(|| DEFAULT_DESKTOP_IMAGE.to_string()),
+                image: req.image,
                 width,
                 height,
                 net: req.net,

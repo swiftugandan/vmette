@@ -55,9 +55,12 @@ use vmette_daemon::settle::{Frame, SettleConfig, SettleDetector, SettleState};
 /// short enough that a settled screen is returned promptly.
 const SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(120);
 
-/// Default OCI ref for the desktop rootfs image, baked in the same way the
-/// MCP/CLI default `python:3.12-alpine` etc. Overridable per `start` request.
-pub const DEFAULT_DESKTOP_IMAGE: &str = "ghcr.io/chamuka-inc/vmette-desktop:latest";
+// The desktop rootfs spec arrives already resolved in the `start` request —
+// the client (CLI / `vmette-mcp`) picks it via `vmette_assets::default_desktop_image`
+// (explicit `--image` → `$VMETTE_DESKTOP_IMAGE` → local `vmette-desktop-rootfs.tar`
+// → registry fallback), exactly as it resolves the kernel/initramfs. The daemon
+// stays a pure resolver and owns no desktop-image default.
+
 /// Default vCPUs for a desktop session when the request omits `vcpus`.
 pub const DEFAULT_DESKTOP_VCPUS: u8 = 2;
 /// Default RAM (MiB) for a desktop session when the request omits `mem_mib`.
@@ -185,17 +188,15 @@ impl Registry {
             .offline(params.offline)
             .guest_helpers_dir(self.guest_helpers_dir.clone());
         let artifact = provider.resolve(&params.image, &ctx).map_err(|e| {
-            if params.image == DEFAULT_DESKTOP_IMAGE {
-                anyhow!(
-                    "resolving default desktop image {}: {e}\n\
-                     If the published image is unreachable, build the rootfs \
-                     locally with scripts/build-desktop-image.sh and pass it as \
-                     --image tar+file:///path/to/rootfs.tar (see docs/DESKTOP.md).",
-                    params.image
-                )
-            } else {
-                anyhow!("resolving desktop image {}: {e}", params.image)
-            }
+            anyhow!(
+                "resolving desktop image {}: {e}\n\
+                 If this is the unpublished registry fallback, build the rootfs \
+                 locally with `make desktop-image` — it exports to \
+                 assets/vmette-desktop-rootfs.tar, which the CLI/MCP then \
+                 auto-discover (or pass --image / set $VMETTE_DESKTOP_IMAGE). \
+                 See docs/DESKTOP.md.",
+                params.image
+            )
         })?;
 
         let mut cfg = Config::new(params.kernel, params.initramfs);

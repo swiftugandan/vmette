@@ -50,6 +50,7 @@ a `curl | install.sh` install boots with no asset flags.
 | `--vsock-port` | N | `-1`: disable vsock device entirely. `0`: auto-pick 50000–59999 (default). `>0`: explicit port. The chosen port is exported into the guest's exec env as `VMETTE_VSOCK_PORT`. |
 | `--vcpus` | N | Default 1. |
 | `--mem-mib` | N | Default 512. |
+| `--quiet` | | Suppress the `[vmette]` launcher banner and the `guest stopped`/`timeout` status lines on stderr. Errors are still printed, the exit code is unchanged, and guest console output on stdout is untouched. Useful when scripting or capturing output (the MCP server passes this internally). |
 
 ## Snapshot (Apple Silicon only)
 

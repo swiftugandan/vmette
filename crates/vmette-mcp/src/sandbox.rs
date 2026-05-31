@@ -25,6 +25,55 @@ use tokio::process::Command;
 /// human-readable marker so the agent knows output was clipped.
 const OUTPUT_CAP_BYTES: usize = 1024 * 1024; // 1 MiB
 
+/// Sentinels printed around the user command's output so we can slice the
+/// guest *exec* output out of the full guest console, which also carries
+/// PID-1 init chatter (`[init] mounted …`, `[init] exit=N`) and the kernel's
+/// `reboot: Power down`. We wrap the command (see [`wrap_exec`]) to print
+/// these on their own lines, then [`slice_exec_output`] keeps only what lies
+/// between them. The tokens are matched bounded by real newlines, so the
+/// copy that init echoes in its `[init] exec: …` line — where the surrounding
+/// `\n` are literal backslash-n, not newlines — never matches.
+const MARKER_BEGIN: &str = "__VMETTE_EXEC_BEGIN__";
+const MARKER_END: &str = "__VMETTE_EXEC_END__";
+
+/// Wrap a user command so its stdout/stderr (which share the guest console)
+/// are bracketed by [`MARKER_BEGIN`]/[`MARKER_END`]. The command runs in a
+/// subshell `( … )` so an inner `exit N` only leaves the subshell — the
+/// markers and the real exit code still propagate. Newlines (not quoting)
+/// separate the pieces, so no escaping of the user command is needed and
+/// multi-line commands pass through verbatim.
+fn wrap_exec(cmd: &str) -> String {
+    format!(
+        "printf '\\n{MARKER_BEGIN}\\n'\n(\n{cmd}\n)\n__vmette_rc=$?\nprintf '\\n{MARKER_END}\\n'\nexit $__vmette_rc\n"
+    )
+}
+
+/// Keep only the bytes the user command produced, dropping the init/kernel
+/// framing outside the markers. Falls back to the raw console when the
+/// markers are absent (e.g. the guest died before the exec, or output was
+/// truncated past the end marker) so failures are never silently blanked.
+///
+/// The guest console is CRLF (the hvc0 tty applies ONLCR, so every guest `\n`
+/// arrives as `\r\n`). We normalise to LF first — both so the LF-bounded
+/// marker match is reliable and so a Linux guest's output doesn't reach the
+/// agent with stray carriage returns. Lone `\r` (e.g. a progress bar redraw)
+/// is left intact.
+fn slice_exec_output(raw: &str) -> String {
+    let raw = raw.replace("\r\n", "\n");
+    let begin = format!("\n{MARKER_BEGIN}\n");
+    let end = format!("\n{MARKER_END}\n");
+    match raw.find(&begin) {
+        Some(b) => {
+            let after = &raw[b + begin.len()..];
+            match after.find(&end) {
+                Some(e) => after[..e].to_string(),
+                None => after.to_string(), // end marker lost (truncated / crash)
+            }
+        }
+        None => raw, // no markers — surface the raw console
+    }
+}
+
 /// Grace period added on top of the guest's `--timeout` for the
 /// host-side wall-clock guard. If vmette itself wedges (segfaults,
 /// fails to honour its own --timeout) the host timeout fires after
@@ -148,7 +197,10 @@ impl Sandbox {
             cmd.arg("--share")
                 .arg(format!("{}={}", s.tag, s.path.display()));
         }
-        cmd.arg("--exec").arg(&req.exec);
+        // `--quiet` drops vmette's config banner + "guest stopped" lines from
+        // stderr; the agent only wants the guest's output, not the launcher's.
+        cmd.arg("--quiet");
+        cmd.arg("--exec").arg(wrap_exec(&req.exec));
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
@@ -175,7 +227,7 @@ impl Sandbox {
         let stderr_buf = stderr_task.await.context("stderr reader panicked")??;
 
         Ok(RunReply {
-            stdout: stdout_buf,
+            stdout: slice_exec_output(&stdout_buf),
             stderr: stderr_buf,
             exit: status.code().unwrap_or(-1),
         })
@@ -265,4 +317,84 @@ fn locate_vmette_bin() -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reconstruct the console the guest would emit for a given user-command
+    /// output: the init `[init] exec:` echo of the wrapped script (with the
+    /// markers as *literal* `\n`), the real printf'd markers around the real
+    /// output, then trailing init/kernel framing.
+    fn fake_console(user_output: &str) -> String {
+        let wrapped = wrap_exec("USERCMD");
+        format!(
+            "[init] mounted virtio-fs 'rootfs' at /newroot\n\
+             [init] exec: {echo}\n\
+             \n{MARKER_BEGIN}\n{out}\n{MARKER_END}\n\
+             [init] exit=0\n[    0.5] reboot: Power down\n",
+            // init echoes the script on one logical line; its embedded \n are
+            // literal backslash-n, so collapse the real newlines to show that.
+            echo = wrapped.replace('\n', "\\n"),
+            out = user_output,
+        )
+    }
+
+    #[test]
+    fn slices_between_markers_only() {
+        let console = fake_console("hello\nworld");
+        assert_eq!(slice_exec_output(&console), "hello\nworld");
+    }
+
+    #[test]
+    fn ignores_the_init_echo_of_the_markers() {
+        // The echoed wrapped script contains the marker tokens; the slice must
+        // not latch onto them (they are not bounded by real newlines).
+        let console = fake_console("payload");
+        assert_eq!(slice_exec_output(&console), "payload");
+        assert!(console.contains(MARKER_BEGIN)); // present in the echo too
+    }
+
+    #[test]
+    fn preserves_trailing_newline() {
+        // printf injects a leading \n before END, so a user trailing newline
+        // is kept and the injected one dropped.
+        let console = fake_console("ends-with-nl\n");
+        assert_eq!(slice_exec_output(&console), "ends-with-nl\n");
+    }
+
+    #[test]
+    fn empty_output_between_markers() {
+        let console = fake_console("");
+        assert_eq!(slice_exec_output(&console), "");
+    }
+
+    #[test]
+    fn handles_crlf_console() {
+        // The real console is CRLF; the marker match must survive it and the
+        // returned output must be LF.
+        let console = "[init] x\r\n\r\n__VMETTE_EXEC_BEGIN__\r\nline1\r\nline2\r\n__VMETTE_EXEC_END__\r\n[init] exit=0\r\n";
+        assert_eq!(slice_exec_output(console), "line1\nline2");
+    }
+
+    #[test]
+    fn falls_back_to_raw_without_markers() {
+        let raw = "boot failed before exec\nno markers here\n";
+        assert_eq!(slice_exec_output(raw), raw);
+    }
+
+    #[test]
+    fn missing_end_marker_returns_tail() {
+        // Truncation can drop the end marker; keep everything after begin.
+        let raw = format!("[init] exec: …\n\n{MARKER_BEGIN}\npartial output, then cut");
+        assert_eq!(slice_exec_output(&raw), "partial output, then cut");
+    }
+
+    #[test]
+    fn wrap_runs_user_command_in_isolating_subshell() {
+        let w = wrap_exec("exit 9");
+        assert!(w.contains("(\nexit 9\n)"));
+        assert!(w.contains("exit $__vmette_rc"));
+    }
 }

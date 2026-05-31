@@ -65,6 +65,11 @@ impl DaemonClient {
         net: bool,
         offline: bool,
     ) -> Result<String> {
+        // Resolve the desktop rootfs spec client-side, the same way the
+        // kernel/initramfs assets are resolved: explicit per-call `image` →
+        // `$VMETTE_DESKTOP_IMAGE` → locally built `vmette-desktop-rootfs.tar` →
+        // registry fallback. The daemon receives a concrete spec.
+        let image = vmette_assets::default_desktop_image(image);
         // `vcpus`/`mem_mib` unset → the daemon applies its desktop defaults.
         let reply = self
             .call(&DesktopRequest::DesktopStart(DesktopStart {

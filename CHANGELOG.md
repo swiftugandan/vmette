@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`vmette --quiet`.** Suppresses the `[vmette]` launcher banner and the
+  `guest stopped`/`timeout` status lines on stderr (errors still print; the exit
+  code and guest stdout are untouched). The MCP server passes it internally so an
+  agent's captured output isn't diluted by launcher chatter.
+- **Desktop rootfs as an auto-discovered boot asset (one source of truth).**
+  The desktop image now follows the same client-side discovery as the kernel /
+  initramfs instead of a daemon-resident registry default. `make desktop-image`
+  builds `images/vmette-desktop/` from source and exports it to
+  `assets/vmette-desktop-rootfs.tar`; `vmette` and `vmette-mcp` resolve the
+  desktop image as: explicit `--image` → `$VMETTE_DESKTOP_IMAGE` → discovered
+  `assets/vmette-desktop-rootfs.tar` (`tar+file://`) → `ghcr.io/...` registry
+  fallback, and pass a concrete spec to the daemon (which no longer owns a
+  desktop-image default). Resolution is client-side, so `$VMETTE_DESKTOP_IMAGE`
+  is read from the client (your shell / the `vmette-mcp` process), not the
+  daemon. New `vmette_assets::{find, default_desktop_image}` and
+  `scripts/build-desktop-image.sh --export` / `make desktop-image`. This removes
+  the footgun where the published / exported image lagged the source (a fixed
+  agent or chromium flags silently
+  absent). Building the image needs Docker; running vmette never does.
 - **Block-image rootfs (squashfs).** Providers can now hand back a prebuilt
   block image instead of a directory. A `.sqfs` is attached read-only as
   virtio-blk slot 0 and the guest builds a tmpfs overlay over it, so the rootfs
@@ -111,6 +130,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **MCP `execute` / `workspace_run` output is now just the command's output.**
+  The guest exec runs inside marker-bracketed framing so the server slices the
+  guest console down to exactly what the command produced — the surrounding
+  `[init] mounted …`, `[init] exec: …`, `[init] exit=N`, and kernel
+  `reboot: Power down` lines no longer leak into `stdout`, and CRLF console line
+  endings are normalised to LF. Combined with `--quiet`, an agent now receives
+  clean stdout/stderr instead of a wall of boot/teardown noise. Exit codes are
+  preserved (an inner `exit N` runs in an isolating subshell).
+- **`desktop_launch` no longer false-negatives on a slow first paint.** The
+  readiness verdict polled for a frame change only *between* polls, so a short
+  `wait_ms` could return "did it start?" on a frame that plainly showed the app
+  (software-rendered first paint can exceed a few seconds). The verdict now also
+  reconciles the final settled frame against the pre-launch baseline, so an app
+  that painted is reported as launched — agents won't double-launch.
 - **Settle no longer stalls on a small persistent animation.** A spinner or
   other small, continuously moving region is now treated as a moving region and
   settle resolves *around* it, rather than that churn keeping the screen from

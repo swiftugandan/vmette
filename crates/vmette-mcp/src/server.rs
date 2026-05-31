@@ -140,8 +140,10 @@ pub struct WorkspaceDestroyArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DesktopStartArgs {
-    /// OCI ref for the desktop rootfs image. Defaults to the baked-in
-    /// vmette-desktop image. Must be x86_64 and ship the desktop agent.
+    /// Rootfs spec for the desktop image (OCI ref / tar+file:// / path). When
+    /// omitted, resolves to `$VMETTE_DESKTOP_IMAGE`, else a locally built
+    /// `assets/vmette-desktop-rootfs.tar`, else the registry fallback. Must be
+    /// x86_64 and ship the desktop agent.
     pub image: Option<String>,
     /// Display size as "WIDTHxHEIGHT" (default: 1280x800).
     pub size: Option<String>,
@@ -730,8 +732,13 @@ impl VmetteServer {
     ) -> Result<CallToolResult, ErrorData> {
         // Record the pre-launch frame as the diff baseline so the readiness
         // loop can distinguish "the app painted" from "still the bare
-        // desktop". We want only the side effect, so ignore the result.
-        let _ = self.daemon.what_changed(&args.session_id).await;
+        // desktop". Keep the frame itself for a final reconciliation below.
+        let baseline_png = self
+            .daemon
+            .what_changed(&args.session_id)
+            .await
+            .ok()
+            .map(|c| c.png_base64);
 
         // Background the command so the exec returns immediately (the readiness
         // loop below is what waits for the window, not the exec call), and
@@ -776,7 +783,21 @@ impl VmetteServer {
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
-        let note = if painted {
+        // The polling loop only catches a change that lands *between two
+        // polls*; a short wait_ms can miss an app that first-paints after the
+        // last poll but before the settle capture, yielding a false "did it
+        // start?" on a frame that plainly shows the app. Reconcile against the
+        // pre-launch baseline: if the final settled frame differs, it painted.
+        // A *missing* baseline (the pre-launch capture errored) is no evidence
+        // either way, so it must not upgrade the verdict — fall back to the
+        // poll-loop result, or we'd report a false "launched" for an app that
+        // never painted whenever that one capture happened to fail.
+        let started = painted
+            || match baseline_png.as_ref() {
+                Some(b) => *b != settle.png_base64,
+                None => false,
+            };
+        let note = if started {
             format!("launched {}", args.command)
         } else {
             format!(

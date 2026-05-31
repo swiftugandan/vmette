@@ -217,6 +217,10 @@ fn cmd_start(socket: &PathBuf, args: &[String]) -> Result<Option<String>, String
 
     let kernel = vmette_assets::require_asset(kernel, "vmlinuz-virt")?;
     let initramfs = vmette_assets::require_asset(initramfs, "initramfs-vmette")?;
+    // Resolve the desktop rootfs spec like the kernel/initramfs: explicit
+    // `--image` → `$VMETTE_DESKTOP_IMAGE` → local `vmette-desktop-rootfs.tar` →
+    // registry fallback. The daemon receives a concrete spec.
+    let image = vmette_assets::default_desktop_image(image);
 
     // `vcpus`/`mem_mib` left unset → the daemon applies its desktop defaults.
     let reply = call(

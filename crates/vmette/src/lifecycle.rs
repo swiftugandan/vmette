@@ -55,27 +55,36 @@ pub fn run(config: &Config) -> Result<RunOutput, Error> {
             return Err(e);
         }
     };
-    eprint_banner(config, session.cmdline(), session.vsock_port());
+    if !config.quiet {
+        eprint_banner(config, session.cmdline(), session.vsock_port());
+    }
 
     let end = session.wait();
     restore_terminal();
     match end {
         SessionEnd::Exited(code) => {
-            eprintln!("\r\n[vmette] guest stopped (exit {})\r", code);
+            if !config.quiet {
+                eprintln!("\r\n[vmette] guest stopped (exit {})\r", code);
+            }
             std::process::exit(code);
         }
         SessionEnd::TimedOut => {
-            eprintln!(
-                "\r\n[vmette] timeout {}s reached; guest force-stopped (exit 124)\r",
-                config.timeout_seconds.unwrap_or(0)
-            );
+            if !config.quiet {
+                eprintln!(
+                    "\r\n[vmette] timeout {}s reached; guest force-stopped (exit 124)\r",
+                    config.timeout_seconds.unwrap_or(0)
+                );
+            }
             std::process::exit(124);
         }
         SessionEnd::Stopped => {
-            eprintln!("\r\n[vmette] guest stopped (exit 0)\r");
+            if !config.quiet {
+                eprintln!("\r\n[vmette] guest stopped (exit 0)\r");
+            }
             std::process::exit(0);
         }
         SessionEnd::Error(msg) => {
+            // An error is always worth surfacing, even under --quiet.
             eprintln!("\r\n[vmette] guest stopped with error: {}\r", msg);
             std::process::exit(1);
         }

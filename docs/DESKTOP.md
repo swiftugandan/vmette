@@ -49,27 +49,57 @@ sessions left untouched for longer than the idle TTL (30 min).
    vmetted &
    ```
 
-2. **The desktop rootfs image.** Build and (optionally) push it:
+2. **The desktop rootfs image.** Build it from source into the canonical
+   asset; the CLI and MCP auto-discover it from there:
 
    ```sh
-   bash scripts/build-desktop-image.sh                 # local build
-   bash scripts/build-desktop-image.sh --push          # push to ghcr.io
-   bash scripts/build-desktop-image.sh --tag my/desktop:dev
+   make desktop-image       # build images/vmette-desktop/ → assets/vmette-desktop-rootfs.tar
    ```
 
-   The default ref is `ghcr.io/chamuka-inc/vmette-desktop:latest`, baked into
-   the daemon and MCP defaults the same way `python:3.12-alpine` is. The image
-   is x86_64-only (`--platform linux/amd64`), matching vmette's guest assets;
-   on Apple Silicon the build needs Docker buildx + qemu emulation.
+   This is the **single source of truth**: it rebuilds the agent and the
+   chromium flags from the current tree, so a desktop session always reflects
+   your source — never a stale published image. The export lands at
+   `assets/vmette-desktop-rootfs.tar`, which both clients discover the same way
+   they discover `vmlinuz-virt` / `initramfs-vmette` (`$VMETTE_ASSETS_DIR`,
+   `./assets`, `<install prefix>/assets`). No env var, no manual `docker
+   export`, no per-call `--image` needed.
+
+   **Resolution order** (client-side, in `vmette` and `vmette-mcp`, mirroring
+   how kernel/initramfs are resolved):
+
+   1. explicit `--image REF` (CLI) / `image` arg (MCP) — wins
+   2. `$VMETTE_DESKTOP_IMAGE` (any rootfs spec, e.g. a `tar+file://` or OCI ref)
+   3. discovered `assets/vmette-desktop-rootfs.tar` → `tar+file://…`
+   4. `ghcr.io/chamuka-inc/vmette-desktop:latest` — registry fallback
+
+   Because resolution is client-side, `$VMETTE_DESKTOP_IMAGE` is read from the
+   **client** process (your shell for `vmette desktop start`, the `vmette-mcp`
+   server for `desktop_start`) — not the daemon.
+
+   **Docker: needed to *build*, not to *run*.** `make desktop-image` uses Docker
+   (the rootfs is a Dockerfile; x86_64-only via `--platform linux/amd64`). vmette
+   itself never shells out to Docker — its OCI provider is a self-contained
+   registry client. So a machine **without** Docker can still run computer-use
+   by pointing tiers 1–2 at a Docker-free source: a published OCI ref vmette
+   pulls itself, or a `tar+file://` rootfs you obtained elsewhere. (Tier 4 only
+   works once that ref is published; it is private until first release.)
+
+   To push the image to a registry instead (a deliberate, separate step):
+
+   ```sh
+   bash scripts/build-desktop-image.sh --push           # docker login ghcr.io first
+   bash scripts/build-desktop-image.sh --tag my/desktop:dev --export
+   ```
 
    The image bundles `xvfb`, `openbox`, `x11-utils`, base fonts, the compiled
-   `vmette-desktop-agent`, and an entrypoint that starts `Xvfb`, the WM, then
-   the agent. It also ships `chromium` plus an `/etc/chromium.d/` flags file so
-   a bare `chromium <url>` renders under the headless software-GL guest
-   (`--no-sandbox`, `--use-gl=swiftshader`, …) — the browser incantation lives
-   with the browser, in the image, so `desktop_launch` and the CLI stay
-   application-agnostic. Drop the `chromium` install line to shrink the image;
-   the agent works without it (you can launch any X app).
+   `vmette-desktop-agent`, and an entrypoint that starts `Xvfb`, the WM (with a
+   neutral root colour so an idle desktop isn't pure black), then the agent. It
+   also ships `chromium` plus an `/etc/chromium.d/` flags file so a bare
+   `chromium <url>` renders under the headless software-GL guest (`--no-sandbox`,
+   `--use-gl=swiftshader`, `--disable-dev-shm-usage`, …) — the browser
+   incantation lives with the browser, in the image, so `desktop_launch` and the
+   CLI stay application-agnostic. Drop the `chromium` install line to shrink the
+   image; the agent works without it (you can launch any X app).
 
 ## Use it (CLI)
 
@@ -156,8 +186,8 @@ One request object per connection; one reply object back.
 // → boot a session
 { "kind": "desktop_start",
   "kernel": "/abs/vmlinuz-virt", "initramfs": "/abs/initramfs-vmette",
-  "image": "ghcr.io/chamuka-inc/vmette-desktop:latest",   // optional
-  "size": "1280x800",                                       // optional
+  "image": "tar+file:///abs/assets/vmette-desktop-rootfs.tar", // required; client-resolved
+  "size": "1280x800",                                          // optional
   "net": false, "offline": false }
 // ← { "kind": "session", "session_id": "a1b2c3..." }
 

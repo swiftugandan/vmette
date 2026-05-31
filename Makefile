@@ -1,6 +1,6 @@
 SHELL := /bin/bash
 
-.PHONY: help build header universal dist publish assets init guest-bin run shell test clean
+.PHONY: help build header universal dist publish assets init guest-bin desktop-image run shell test clean
 
 help:
 	@awk -F':.*##' '/^[a-zA-Z_-]+:.*##/ { printf "  %-12s %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
@@ -63,6 +63,9 @@ init: assets   ## Repack initramfs with vmette's custom /init
 
 guest-bin: assets  ## Cross-compile static guest helpers (vsock-send + vsock-runner)
 	bash scripts/build-vsock-send.sh
+
+desktop-image: ## Build the desktop rootfs from source → assets/vmette-desktop-rootfs.tar (the local source of truth the CLI/MCP auto-discover)
+	bash scripts/build-desktop-image.sh --export
 
 run: init guest-bin   ## Build + sign vmette, boot guest, run default probe
 	bash scripts/run.sh

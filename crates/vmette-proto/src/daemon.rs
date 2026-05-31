@@ -91,8 +91,9 @@ pub enum Frame {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DesktopRequest {
-    /// Boot a persistent desktop VM. Defaulted fields (`image`, `vcpus`,
-    /// `mem_mib`, `size`) are resolved by the daemon when absent.
+    /// Boot a persistent desktop VM. `image` is resolved client-side; the
+    /// remaining defaulted fields (`vcpus`, `mem_mib`, `size`) are filled by
+    /// the daemon when absent.
     DesktopStart(DesktopStart),
     /// Run one computer-use action against a live session.
     DesktopAction(DesktopAction),
@@ -107,14 +108,16 @@ pub enum DesktopRequest {
 
 /// Payload of [`DesktopRequest::DesktopStart`]. The kernel + initramfs are the
 /// ordinary vmette assets; desktop-ness comes from `image` + the Agent
-/// workload. `None` fields take the daemon's defaults.
+/// workload. `None` optional fields take the daemon's defaults.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DesktopStart {
     pub kernel: PathBuf,
     pub initramfs: PathBuf,
-    /// OCI/tar/path rootfs ref; daemon defaults to its baked desktop image.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub image: Option<String>,
+    /// OCI/tar/path rootfs spec. Resolved client-side (explicit `--image` →
+    /// `$VMETTE_DESKTOP_IMAGE` → local `vmette-desktop-rootfs.tar` → registry
+    /// fallback) exactly like kernel/initramfs, so the daemon receives a
+    /// concrete spec and owns no desktop-image default.
+    pub image: String,
     /// "WIDTHxHEIGHT"; daemon defaults to 1280x800 when absent/unparseable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<String>,
@@ -278,7 +281,7 @@ mod tests {
         let j = serde_json::to_string(&DesktopRequest::DesktopStart(DesktopStart {
             kernel: "/k".into(),
             initramfs: "/i".into(),
-            image: None,
+            image: "alpine:3.20".into(),
             size: None,
             net: true,
             offline: false,
@@ -286,10 +289,11 @@ mod tests {
             mem_mib: None,
         }))
         .unwrap();
-        // kind + the always-present fields, no image/size/vcpus/mem_mib.
+        // kind + the always-present fields (image is required, resolved
+        // client-side); size/vcpus/mem_mib stay omitted when None.
         assert_eq!(
             j,
-            r#"{"kind":"desktop_start","kernel":"/k","initramfs":"/i","net":true,"offline":false}"#
+            r#"{"kind":"desktop_start","kernel":"/k","initramfs":"/i","image":"alpine:3.20","net":true,"offline":false}"#
         );
     }
 

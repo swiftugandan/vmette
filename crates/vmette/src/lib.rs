@@ -110,6 +110,11 @@ pub struct Config {
     /// Xvfb framebuffer size `(width, height)` for the desktop, emitted on
     /// the cmdline only when `workload` is [`WorkloadStrategy::Agent`].
     pub display_size: (u32, u32),
+    /// Suppress the human-facing launcher banner + "guest stopped" lines on
+    /// stderr (errors still print). Set by the CLI's `--quiet`; used by the
+    /// MCP server so an agent's captured output isn't polluted by launcher
+    /// chatter. Has no effect on guest console output.
+    pub quiet: bool,
 }
 
 impl Config {
@@ -136,6 +141,7 @@ impl Config {
             resume_snapshot: None,
             workload: WorkloadStrategy::OneShot,
             display_size: (1280, 800),
+            quiet: false,
         }
     }
 

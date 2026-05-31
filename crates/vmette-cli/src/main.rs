@@ -44,6 +44,7 @@ fn usage() -> ! {
            --vsock-port       N         -1=disable; 0=auto-pick 50000-59999 (default); >0=explicit\n\
            --vcpus            N         default 1\n\
            --mem-mib          N         default 512\n\
+           --quiet                      suppress the launcher banner + status lines on stderr\n\
          \n\
          snapshot (Apple Silicon only):\n\
            --build-snapshot   PATH      boot, wait for guest READY, pause, save\n\
@@ -97,6 +98,7 @@ fn parse_args() -> ParsedArgs {
     let mut exec_cmd: Option<String> = None;
     let mut switch_root = false;
     let mut net = false;
+    let mut quiet = false;
     let mut vsock_port = VsockPort::Auto;
     let mut guest_vsock_port: u32 = 1025;
     let mut timeout_seconds: Option<u32> = None;
@@ -192,6 +194,10 @@ fn parse_args() -> ParsedArgs {
                 switch_root = true;
                 i += 1;
             }
+            "--quiet" => {
+                quiet = true;
+                i += 1;
+            }
             "--timeout" => {
                 let v = take(i, "--timeout", false);
                 timeout_seconds = Some(parse_num::<u32>("--timeout", &v));
@@ -283,6 +289,7 @@ fn parse_args() -> ParsedArgs {
     c.exec_cmd = exec_cmd;
     c.switch_root = switch_root;
     c.net = net;
+    c.quiet = quiet;
     c.vsock_port = vsock_port;
     c.guest_vsock_port = guest_vsock_port;
     c.timeout_seconds = timeout_seconds;
