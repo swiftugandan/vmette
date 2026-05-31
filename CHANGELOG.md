@@ -63,6 +63,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     change and then settle, and returns that frame. Carries no app-specific
     knowledge — the software-GL browser flags live in the desktop image
     (`/etc/chromium.d/`), so a bare `chromium <url>` renders.
+  - **Settle-and-hold readiness.** `screenshot_when_settled` (and so
+    `desktop_launch` and `desktop_screenshot_when_settled`) now requires the
+    screen to stay *continuously* settled for a hold window, not just reach a
+    single settled frame. A network-bound app — a browser that paints its chrome
+    and then sits on a blank page while it fetches — read as "settled" mid-load
+    and `desktop_launch` could hand back the half-loaded frame; the hold bridges
+    that chrome-then-content gap (content painting re-opens the settle), while a
+    video/spinner stays excluded as churn and never blocks it. New optional
+    `stable_hold_ms` on the settle request; `desktop_launch` uses a larger hold
+    than the per-action default. Also: `--test-type` added to the desktop
+    image's Chromium flags to drop the `--no-sandbox` warning infobar from every
+    captured frame.
   - New [`docs/DESKTOP.md`](docs/DESKTOP.md).
 
 ### Changed
@@ -85,6 +97,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   out of the "lean" core (`crates/vmette`) into `vmette-daemon`, its only
   consumer; core `vmette` is now VZ + `Session` plus a thin re-export of the
   proto types.
+- **`tar+file://` cache follows the file.** The tar provider keys its cache on
+  the URL, so a local archive rebuilt in place under the same path used to be
+  masked by the prior extraction until the 1-hour TTL lapsed. The cache is now
+  invalidated when the source file's mtime is newer than the cached extraction,
+  so a `tar+file://` rebuild is picked up on the next boot. http(s) URLs are
+  unchanged (TTL governs); `--offline` still pins to cache.
 
 ## [0.1.0] — 2026-05-29
 

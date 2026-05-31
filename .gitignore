@@ -10,3 +10,7 @@
 
 # Local agent / session state (Claude Code)
 /.claude/
+
+# Python bytecode from tests/mcp helpers
+__pycache__/
+*.pyc

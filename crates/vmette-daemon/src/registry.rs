@@ -64,6 +64,11 @@ pub const DEFAULT_DESKTOP_VCPUS: u8 = 2;
 pub const DEFAULT_DESKTOP_MEM_MIB: u64 = 2048;
 /// Default settle-poll timeout when `desktop_screenshot_settled` omits it.
 pub const DEFAULT_SETTLE_TIMEOUT_MS: u64 = 10_000;
+/// Default continuous-settle hold when the request omits `stable_hold_ms`. A
+/// short confirmation that rejects a transient one-frame quiescence without
+/// noticeably slowing an agent's per-action settle. `desktop_launch` overrides
+/// this with a larger hold to bridge a page load's chrome-then-content gap.
+pub const DEFAULT_SETTLE_HOLD_MS: u64 = 500;
 
 /// A live desktop session's host-side handles. The `Session` itself lives on
 /// `thread`; we keep only the `Send` control handles here.
@@ -285,16 +290,37 @@ impl Registry {
         })
     }
 
-    /// Poll the desktop until it *settles*, then return that frame plus the
-    /// regions still moving. Captures a screenshot, decodes it, feeds the
-    /// per-session settle detector, and repeats every [`SETTLE_POLL_INTERVAL`]
-    /// until the detector reports `Settled` or `timeout` elapses. On timeout
-    /// the most recent frame is still returned with `settled = false`, so the
-    /// caller always gets a usable screenshot. Blocking (sleeps + round-trips)
-    /// — call from `spawn_blocking`.
-    pub fn screenshot_when_settled(&self, id: &str, timeout: Duration) -> Result<SettleResult> {
+    /// Poll the desktop until it has been *continuously settled* for
+    /// `stable_hold`, then return that frame plus the regions still moving.
+    /// Captures a screenshot, decodes it, feeds the per-session settle detector,
+    /// and repeats every [`SETTLE_POLL_INTERVAL`] until the screen holds a
+    /// settled run of at least `stable_hold` or `timeout` elapses.
+    ///
+    /// The hold is what makes this robust for a network-bound app: a browser
+    /// paints its chrome and then sits on a *static blank page* while it fetches
+    /// — which the detector correctly reads as settled. Returning on that first
+    /// settle hands back a half-loaded frame. Requiring the settle to persist
+    /// bridges the gap: when the content finally paints, those tiles change and
+    /// the verdict flips back to `Unsettled`, resetting the hold until the page
+    /// truly quiesces. A video/spinner is excluded as churn by the detector, so
+    /// it stays `Settled` throughout and never blocks the hold.
+    ///
+    /// On timeout the most recent frame is still returned (with `settled` true
+    /// if we were mid-hold, else false), so the caller always gets a usable
+    /// screenshot. Blocking (sleeps + round-trips) — call from `spawn_blocking`.
+    pub fn screenshot_when_settled(
+        &self,
+        id: &str,
+        timeout: Duration,
+        stable_hold: Duration,
+    ) -> Result<SettleResult> {
         let (client, detector) = self.client_and_detector(id)?;
         let deadline = Instant::now() + timeout;
+        // When the current continuous settled run began; `None` whenever the
+        // screen is not settled. Only the anchor instant needs to persist
+        // across polls — the frame itself is always the latest capture, in hand
+        // below, so there is nothing to carry forward.
+        let mut settled_since: Option<Instant> = None;
         loop {
             let (header, payload) = client
                 .request(&Action::Screenshot)
@@ -307,18 +333,43 @@ impl Registry {
             }
             let frame = decode_png(&payload).context("decoding screenshot PNG")?;
             let state = detector.lock().unwrap().push(frame);
-            if let SettleState::Settled { moving } = state {
-                return Ok(SettleResult {
-                    png: payload,
-                    settled: true,
-                    moving,
-                });
-            }
+            // The moving rects for this capture if it was settled; `None`
+            // resets the hold (the screen changed again — e.g. a page's content
+            // painted after its chrome).
+            let settled_moving = match state {
+                SettleState::Settled { moving } => {
+                    // Anchor the run at the first settled frame; once it has
+                    // held for `stable_hold` the screen has truly quiesced.
+                    let since = *settled_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= stable_hold {
+                        return Ok(SettleResult {
+                            png: payload,
+                            settled: true,
+                            moving,
+                        });
+                    }
+                    Some(moving)
+                }
+                _ => {
+                    settled_since = None;
+                    None
+                }
+            };
             if Instant::now() >= deadline {
-                return Ok(SettleResult {
-                    png: payload,
-                    settled: false,
-                    moving: Vec::new(),
+                // Timed out: hand back the latest capture either way. Settled if
+                // this poll was settled (just short of the full hold), else the
+                // best-effort latest frame.
+                return Ok(match settled_moving {
+                    Some(moving) => SettleResult {
+                        png: payload,
+                        settled: true,
+                        moving,
+                    },
+                    None => SettleResult {
+                        png: payload,
+                        settled: false,
+                        moving: Vec::new(),
+                    },
                 });
             }
             // Keep the idle timer fresh: a long settle wait is active use, not

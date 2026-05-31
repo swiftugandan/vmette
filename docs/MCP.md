@@ -193,7 +193,7 @@ look at. Full reference, protocol, and image build in
 |------|-------|---------|
 | `desktop_start` | `image?`, `size?`, `network?` | session id |
 | `desktop_screenshot` | `session_id` | PNG image block |
-| `desktop_screenshot_when_settled` | `session_id`, `timeout_ms?` | note + PNG, once the screen stops changing |
+| `desktop_screenshot_when_settled` | `session_id`, `timeout_ms?` | note + PNG, once the screen has stopped changing and stayed still |
 | `desktop_what_changed` | `session_id` | note + PNG of the region changed since the last capture |
 | `desktop_cursor_position` | `session_id` | `"x y"` |
 | `desktop_move` / `desktop_click` / `desktop_double_click` / `desktop_right_click` | `session_id`, `x`, `y` | status |
@@ -201,7 +201,16 @@ look at. Full reference, protocol, and image build in
 | `desktop_key` | `session_id`, `keys` (e.g. `ctrl+c`) | status |
 | `desktop_scroll` | `session_id`, `x`, `y`, `direction`, `amount` | status |
 | `desktop_exec` | `session_id`, `command` (e.g. `xterm &`) | status |
+| `desktop_launch` | `session_id`, `command`, `wait_ms?` | note + PNG of the app's first settled frame |
 | `desktop_stop` | `session_id` | status |
+
+`desktop_launch` is the one-call "start an app and see it" tool: it backgrounds
+the command, waits for the window to paint, then for the screen to **settle and
+stay settled**, and returns that frame. Prefer it over `desktop_exec` + manual
+`desktop_screenshot` polling. The settle is held briefly so a network-bound app
+(a browser painting its chrome, then fetching its page) returns the *loaded*
+frame rather than a blank mid-load one — the same hold backs
+`desktop_screenshot_when_settled`.
 
 ## Security model
 

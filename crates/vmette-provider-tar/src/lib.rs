@@ -142,7 +142,8 @@ impl RootfsProvider for TarProvider {
         let dest = cache.join(cache_key(url));
         let marker = dest.join(READY_MARKER);
 
-        // Cache-hit fast path: marker present AND (offline OR within TTL).
+        // Cache-hit fast path: marker present AND (offline OR within TTL AND
+        // the source hasn't been rebuilt under us).
         if marker.exists() {
             let age = marker
                 .metadata()
@@ -150,8 +151,15 @@ impl RootfsProvider for TarProvider {
                 .ok()
                 .and_then(|t| SystemTime::now().duration_since(t).ok())
                 .unwrap_or(Duration::ZERO);
-            let fresh_enough =
-                ctx.is_offline() || self.cache_ttl.map(|ttl| age <= ttl).unwrap_or(false);
+            let within_ttl = self.cache_ttl.map(|ttl| age <= ttl).unwrap_or(false);
+            // The cache key is the URL, not the content, so a `tar+file://`
+            // archive rebuilt in place under the same path would otherwise be
+            // masked by the prior extraction until the TTL lapses. Treat the
+            // cache as stale when the local source is newer than the marker, so
+            // a local rebuild is picked up immediately. Offline always pins to
+            // cache (better-stale-than-failed), matching the http path.
+            let source_changed = source_newer_than(url, &marker);
+            let fresh_enough = ctx.is_offline() || (within_ttl && !source_changed);
             if fresh_enough {
                 debug!(path = %dest.display(), age_s = age.as_secs(), "tar cache hit");
                 if let Some(src) = ctx.guest_helpers() {
@@ -164,7 +172,12 @@ impl RootfsProvider for TarProvider {
                     read_only: false,
                 });
             }
-            debug!(path = %dest.display(), age_s = age.as_secs(), "tar cache expired; refetching");
+            debug!(
+                path = %dest.display(),
+                age_s = age.as_secs(),
+                source_changed,
+                "tar cache stale; refetching"
+            );
         }
 
         if ctx.is_offline() {
@@ -322,6 +335,32 @@ impl RootfsProvider for TarProvider {
 
 // ---- helpers -------------------------------------------------------------
 
+/// The local filesystem path a `tar+file://` URL refers to, or `None` for a
+/// non-file URL. RFC 8089: `file://localhost/abs` is equivalent to
+/// `file:///abs`, so a leading `localhost/` is stripped.
+fn file_url_path(url: &str) -> Option<String> {
+    let path = url.strip_prefix("file://")?;
+    Some(
+        path.strip_prefix("localhost/")
+            .map(|p| format!("/{p}"))
+            .unwrap_or_else(|| path.to_string()),
+    )
+}
+
+/// True only for a `file://` URL whose source archive is strictly newer than
+/// the cached extraction's ready-marker — i.e. the local tarball was rebuilt in
+/// place and the cache must be re-extracted. `false` for http(s) URLs (no local
+/// file to compare; the TTL governs those) and whenever either mtime is
+/// unreadable (degrade to trusting the cache rather than thrashing it).
+fn source_newer_than(url: &str, marker: &Path) -> bool {
+    let Some(path) = file_url_path(url) else {
+        return false;
+    };
+    let src = std::fs::metadata(&path).and_then(|m| m.modified());
+    let mark = std::fs::metadata(marker).and_then(|m| m.modified());
+    matches!((src, mark), (Ok(s), Ok(m)) if s > m)
+}
+
 /// Stable cache directory name for a URL: a readable prefix (last ~80
 /// chars of the sanitised URL, biased toward the filename) plus a
 /// 16-hex hash of the full URL. The hash prevents two URLs that share
@@ -360,13 +399,7 @@ fn cache_key(url: &str) -> String {
 /// [`extract_into`]), so neither a large `file://` rootfs nor a long HTTP
 /// body is buffered up front.
 fn open_source(url: &str, timeout: Duration) -> Result<Box<dyn Read + Send>, Error> {
-    if let Some(path) = url.strip_prefix("file://") {
-        // RFC 8089: `file://localhost/abs` is equivalent to `file:///abs`.
-        // Accept both by stripping a leading `localhost/` if present.
-        let path = path
-            .strip_prefix("localhost/")
-            .map(|p| format!("/{p}"))
-            .unwrap_or_else(|| path.to_string());
+    if let Some(path) = file_url_path(url) {
         let file =
             std::fs::File::open(&path).map_err(|e| Error::Download(format!("open {path}: {e}")))?;
         return Ok(Box::new(file));
@@ -537,6 +570,52 @@ mod tests {
         // Same input → same key across calls (used to invalidate caches).
         let url = "https://example.com/r.tar.gz";
         assert_eq!(cache_key(url), cache_key(url));
+    }
+
+    #[test]
+    fn file_url_path_handles_localhost_form() {
+        assert_eq!(
+            file_url_path("file:///tmp/a.tar").as_deref(),
+            Some("/tmp/a.tar")
+        );
+        assert_eq!(
+            file_url_path("file://localhost/tmp/a.tar").as_deref(),
+            Some("/tmp/a.tar")
+        );
+        assert_eq!(file_url_path("https://example.com/a.tar"), None);
+    }
+
+    #[test]
+    fn source_newer_than_invalidates_on_in_place_rebuild() {
+        let dir = TmpDir::new("source-newer");
+        let tar = dir.0.join("rootfs.tar");
+        let marker = dir.0.join(READY_MARKER);
+        let url = format!("file://{}", tar.display());
+
+        // Marker first, then (later) the source: a rebuilt-in-place archive is
+        // newer than the cached extraction → must invalidate.
+        std::fs::write(&marker, "ok\n").unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&tar, b"new-content").unwrap();
+        assert!(
+            source_newer_than(&url, &marker),
+            "a source newer than the marker must invalidate the cache"
+        );
+
+        // Re-touch the marker after the source: cache is now up to date.
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&marker, "ok\n").unwrap();
+        assert!(
+            !source_newer_than(&url, &marker),
+            "a marker newer than the source must keep the cache"
+        );
+
+        // A missing source file degrades to trusting the cache (no thrash).
+        std::fs::remove_file(&tar).unwrap();
+        assert!(!source_newer_than(&url, &marker));
+
+        // http(s) URLs never compare against a local file.
+        assert!(!source_newer_than("https://example.com/r.tar.gz", &marker));
     }
 
     #[test]

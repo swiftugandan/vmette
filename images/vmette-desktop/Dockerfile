@@ -59,10 +59,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # wrapper that sources /etc/chromium.d/* and appends $CHROMIUM_FLAGS, so the
 # software-GL / root-sandbox incantation lives here, with the app — not in any
 # caller. Without these the window maps but stays black: we are root with user
-# namespaces off (--no-sandbox) and there is no GPU (software GL).
+# namespaces off (--no-sandbox) and there is no GPU (software GL). `--test-type`
+# suppresses the "unsupported command-line flag: --no-sandbox" infobar that
+# otherwise sits across the top of every frame the agent sees.
 RUN mkdir -p /etc/chromium.d \
     && printf '%s\n' \
-        'export CHROMIUM_FLAGS="$CHROMIUM_FLAGS --no-sandbox --disable-dev-shm-usage --disable-gpu --disable-gpu-compositing --use-gl=swiftshader --no-first-run --disable-features=Translate"' \
+        'export CHROMIUM_FLAGS="$CHROMIUM_FLAGS --no-sandbox --test-type --disable-dev-shm-usage --disable-gpu --disable-gpu-compositing --use-gl=swiftshader --no-first-run --disable-features=Translate"' \
         > /etc/chromium.d/00-vmette-swiftshader
 
 COPY --from=builder /usr/local/bin/vmette-desktop-agent /usr/local/bin/vmette-desktop-agent

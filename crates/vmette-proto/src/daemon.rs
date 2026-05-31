@@ -143,6 +143,15 @@ pub struct DesktopScreenshotSettled {
     /// frame anyway (with `settled: false`). Daemon defaults to 10s.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+    /// How long the screen must stay continuously settled before the frame is
+    /// returned. Bridges the quiescent gap a network-bound app shows between
+    /// painting its chrome and its content: a transient settle (a blank page
+    /// mid-load) is interrupted when content paints and so does not satisfy the
+    /// hold, while a video/spinner is excluded as churn and never resets it.
+    /// Daemon defaults to a small confirmation hold; `desktop_launch` passes a
+    /// larger one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stable_hold_ms: Option<u64>,
 }
 
 /// Payload of [`DesktopRequest::DesktopWhatChanged`].

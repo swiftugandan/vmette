@@ -98,18 +98,22 @@ impl DaemonClient {
         }
     }
 
-    /// Poll the desktop until it settles (or `timeout_ms` elapses) and return
-    /// that frame plus the regions still moving.
+    /// Poll the desktop until it has been continuously settled for
+    /// `stable_hold_ms` (or `timeout_ms` elapses) and return that frame plus the
+    /// regions still moving. `None` for either lets the daemon apply its
+    /// default.
     pub async fn screenshot_when_settled(
         &self,
         session_id: &str,
         timeout_ms: Option<u64>,
+        stable_hold_ms: Option<u64>,
     ) -> Result<SettleReply> {
         let reply = self
             .call(&DesktopRequest::DesktopScreenshotSettled(
                 DesktopScreenshotSettled {
                     session_id: session_id.to_string(),
                     timeout_ms,
+                    stable_hold_ms,
                 },
             ))
             .await?;

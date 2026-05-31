@@ -58,7 +58,7 @@ use vmette_proto::daemon::{
 
 use registry::{
     Registry, StartParams, DEFAULT_DESKTOP_IMAGE, DEFAULT_DESKTOP_MEM_MIB, DEFAULT_DESKTOP_VCPUS,
-    DEFAULT_SETTLE_TIMEOUT_MS,
+    DEFAULT_SETTLE_HOLD_MS, DEFAULT_SETTLE_TIMEOUT_MS,
 };
 
 /// How many concurrent desktop VMs the daemon will host. Each is a ~2 GB VM.
@@ -294,8 +294,9 @@ async fn desktop_result(line: &str, registry: Arc<Registry>) -> Result<DesktopRe
         DesktopRequest::DesktopScreenshotSettled(req) => {
             let timeout =
                 Duration::from_millis(req.timeout_ms.unwrap_or(DEFAULT_SETTLE_TIMEOUT_MS));
+            let hold = Duration::from_millis(req.stable_hold_ms.unwrap_or(DEFAULT_SETTLE_HOLD_MS));
             let res = tokio::task::spawn_blocking(move || {
-                registry.screenshot_when_settled(&req.session_id, timeout)
+                registry.screenshot_when_settled(&req.session_id, timeout, hold)
             })
             .await
             .context("settle poll task")??;

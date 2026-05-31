@@ -52,6 +52,13 @@ const DEFAULT_LAUNCH_TIMEOUT_MS: u64 = 60_000;
 const LAUNCH_POLL_MS: u64 = 2_000;
 /// After first paint, how long to let the app finish drawing and settle.
 const LAUNCH_SETTLE_MS: u64 = 15_000;
+/// How long the screen must stay continuously settled before `desktop_launch`
+/// accepts it as the final frame. A browser paints its chrome, then sits on a
+/// blank page while it fetches over the network — a settle the app isn't
+/// actually done with. A hold this long bridges that chrome-then-content gap so
+/// launch returns the loaded page, not the half-loaded one. Larger than the
+/// daemon's per-action default (`DEFAULT_SETTLE_HOLD_MS`) for that reason.
+const LAUNCH_SETTLE_HOLD_MS: u64 = 2_500;
 /// Where `desktop_launch` redirects the launched app's stdout/stderr in-guest.
 /// Chatty GUI apps (a browser emits hundreds of dbus error lines) would
 /// otherwise block on a full stdio pipe before painting; the redirect drains
@@ -515,7 +522,7 @@ impl VmetteServer {
     ) -> Result<CallToolResult, ErrorData> {
         let reply = self
             .daemon
-            .screenshot_when_settled(&args.session_id, args.timeout_ms)
+            .screenshot_when_settled(&args.session_id, args.timeout_ms, None)
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         let note = if reply.settled {
@@ -734,7 +741,11 @@ impl VmetteServer {
         // return that final frame.
         let settle = self
             .daemon
-            .screenshot_when_settled(&args.session_id, Some(LAUNCH_SETTLE_MS))
+            .screenshot_when_settled(
+                &args.session_id,
+                Some(LAUNCH_SETTLE_MS),
+                Some(LAUNCH_SETTLE_HOLD_MS),
+            )
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
