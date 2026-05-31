@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 vmette-assets = { path = "../vmette-assets" }
+vmette-proto  = { path = "../vmette-proto" }
 rmcp      = { version = "1.7", features = ["server", "macros", "transport-io", "schemars"] }
 schemars  = "1"
 tokio     = { version = "1", features = ["full"] }

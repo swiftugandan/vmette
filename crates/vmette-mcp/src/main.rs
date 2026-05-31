@@ -20,6 +20,7 @@ use tracing_subscriber::EnvFilter;
 mod daemon_client;
 mod sandbox;
 mod server;
+mod weburl;
 mod workspace;
 
 use daemon_client::DaemonClient;

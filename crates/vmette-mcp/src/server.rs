@@ -16,6 +16,7 @@
 //!   * `desktop_move` / `desktop_click` / `desktop_double_click` /
 //!     `desktop_right_click` / `desktop_cursor_position` — pointer
 //!   * `desktop_type` / `desktop_key` / `desktop_scroll` / `desktop_exec` — input
+//!   * `desktop_launch` — start a GUI app and return its first painted frame
 //!
 //! Most tools return their result as a single plain-text MCP content
 //! block (`desktop_screenshot` returns an image block). Structured
@@ -23,6 +24,7 @@
 //! plain text is what most agent UIs render sensibly today.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::{Json, Parameters};
@@ -30,16 +32,31 @@ use rmcp::model::{CallToolResult, Content, ServerCapabilities, ServerInfo};
 use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
 use tracing::warn;
+use vmette_proto::agent::{Action, ScrollDirection};
+use vmette_proto::daemon::ActionReply;
 
-use crate::daemon_client::{ActionReply, DaemonClient};
+use crate::daemon_client::DaemonClient;
 use crate::sandbox::{RunReply, RunRequest, Sandbox, Share};
 use crate::workspace::{open_for_read, open_for_write, WorkspaceState};
 
 const DEFAULT_TIMEOUT_S: u32 = 30;
 const DEFAULT_WORKSPACE_TIMEOUT_S: u32 = 60;
 const DEFAULT_FETCH_MAX_BYTES: usize = 20_000;
+
+/// `desktop_launch` readiness budget: how long to wait for the launched app to
+/// first paint before giving up and returning the latest frame. Cold-starting
+/// a GUI app under software rendering can take tens of seconds.
+const DEFAULT_LAUNCH_TIMEOUT_MS: u64 = 60_000;
+/// Interval between first-paint probes in `desktop_launch`.
+const LAUNCH_POLL_MS: u64 = 2_000;
+/// After first paint, how long to let the app finish drawing and settle.
+const LAUNCH_SETTLE_MS: u64 = 15_000;
+/// Where `desktop_launch` redirects the launched app's stdout/stderr in-guest.
+/// Chatty GUI apps (a browser emits hundreds of dbus error lines) would
+/// otherwise block on a full stdio pipe before painting; the redirect drains
+/// them to a file that's inspectable from in-session.
+const LAUNCH_LOG_PATH: &str = "/tmp/vmette-launch.log";
 
 /// Tool inputs ----------------------------------------------------------
 
@@ -177,6 +194,19 @@ pub struct DesktopExecArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct DesktopLaunchArgs {
+    pub session_id: String,
+    /// Shell command that starts a GUI app, e.g. "xterm", "gimp /mnt/a.png",
+    /// or "chromium https://example.com". No trailing '&' needed — the call
+    /// backgrounds it for you and waits for the app to paint.
+    pub command: String,
+    /// Max time to wait for the app to first paint, in milliseconds
+    /// (default: 60000). Cold-starting a GUI app under software rendering
+    /// can take tens of seconds; the latest frame is returned either way.
+    pub wait_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct DesktopSettleArgs {
     /// Session id returned by desktop_start.
     pub session_id: String,
@@ -282,20 +312,11 @@ impl VmetteServer {
     ) -> Result<CallToolResult, ErrorData> {
         let _ = self.gate_network(true)?;
 
-        // Scheme validation: parse with `url` (RFC 3986-compliant) and
-        // reject anything other than http/https. Without this, an agent
-        // could pass `file:///etc/shadow` and urllib would happily open
-        // the path inside the guest's rootfs.
-        let parsed = url::Url::parse(&args.url).map_err(|e| {
-            ErrorData::invalid_params(format!("invalid url {:?}: {}", args.url, e), None)
-        })?;
-        let scheme = parsed.scheme();
-        if scheme != "http" && scheme != "https" {
-            return Err(ErrorData::invalid_params(
-                format!("fetch_url only supports http/https, got scheme {scheme:?}"),
-                None,
-            ));
-        }
+        // Scheme validation: reject anything other than http/https. Without
+        // this, an agent could pass `file:///etc/shadow` and urllib would
+        // happily open the path inside the guest's rootfs.
+        crate::weburl::validate_web_url(&args.url)
+            .map_err(|e| ErrorData::invalid_params(e, None))?;
 
         // Build the Python source. The URL is serialised with
         // `serde_json::to_string` because JSON string syntax is a
@@ -475,9 +496,7 @@ impl VmetteServer {
         &self,
         Parameters(args): Parameters<DesktopSessionArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let reply = self
-            .action(&args.session_id, json!({ "action": "screenshot" }))
-            .await?;
+        let reply = self.action(&args.session_id, Action::Screenshot).await?;
         let png = reply.png_base64.ok_or_else(|| {
             ErrorData::internal_error("screenshot reply had no PNG payload".to_string(), None)
         })?;
@@ -547,7 +566,7 @@ impl VmetteServer {
         Parameters(args): Parameters<DesktopSessionArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let reply = self
-            .action(&args.session_id, json!({ "action": "cursor_position" }))
+            .action(&args.session_id, Action::CursorPosition)
             .await?;
         let x = reply.x.unwrap_or(0);
         let y = reply.y.unwrap_or(0);
@@ -563,7 +582,10 @@ impl VmetteServer {
     ) -> Result<CallToolResult, ErrorData> {
         self.action(
             &args.session_id,
-            json!({ "action": "mouse_move", "x": args.x, "y": args.y }),
+            Action::MouseMove {
+                x: args.x,
+                y: args.y,
+            },
         )
         .await?;
         Ok(ok_text(format!("moved to {} {}", args.x, args.y)))
@@ -574,7 +596,7 @@ impl VmetteServer {
         &self,
         Parameters(args): Parameters<DesktopPointArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.click_at(&args.session_id, args.x, args.y, "left_click")
+        self.click_at(&args.session_id, args.x, args.y, Action::LeftClick)
             .await
     }
 
@@ -583,7 +605,7 @@ impl VmetteServer {
         &self,
         Parameters(args): Parameters<DesktopPointArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.click_at(&args.session_id, args.x, args.y, "double_click")
+        self.click_at(&args.session_id, args.x, args.y, Action::DoubleClick)
             .await
     }
 
@@ -592,7 +614,7 @@ impl VmetteServer {
         &self,
         Parameters(args): Parameters<DesktopPointArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.click_at(&args.session_id, args.x, args.y, "right_click")
+        self.click_at(&args.session_id, args.x, args.y, Action::RightClick)
             .await
     }
 
@@ -601,11 +623,8 @@ impl VmetteServer {
         &self,
         Parameters(args): Parameters<DesktopTypeArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.action(
-            &args.session_id,
-            json!({ "action": "type", "text": args.text }),
-        )
-        .await?;
+        self.action(&args.session_id, Action::Type { text: args.text })
+            .await?;
         Ok(ok_text("typed".to_string()))
     }
 
@@ -616,11 +635,8 @@ impl VmetteServer {
         &self,
         Parameters(args): Parameters<DesktopKeyArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.action(
-            &args.session_id,
-            json!({ "action": "key", "keys": args.keys }),
-        )
-        .await?;
+        self.action(&args.session_id, Action::Key { keys: args.keys })
+            .await?;
         Ok(ok_text("key sent".to_string()))
     }
 
@@ -629,24 +645,26 @@ impl VmetteServer {
         &self,
         Parameters(args): Parameters<DesktopScrollArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        match args.direction.as_str() {
-            "up" | "down" | "left" | "right" => {}
+        let direction = match args.direction.as_str() {
+            "up" => ScrollDirection::Up,
+            "down" => ScrollDirection::Down,
+            "left" => ScrollDirection::Left,
+            "right" => ScrollDirection::Right,
             other => {
                 return Err(ErrorData::invalid_params(
                     format!("direction must be up|down|left|right, got {other:?}"),
                     None,
                 ));
             }
-        }
+        };
         self.action(
             &args.session_id,
-            json!({
-                "action": "scroll",
-                "x": args.x,
-                "y": args.y,
-                "direction": args.direction,
-                "amount": args.amount,
-            }),
+            Action::Scroll {
+                x: args.x,
+                y: args.y,
+                direction,
+                amount: args.amount,
+            },
         )
         .await?;
         Ok(ok_text("scrolled".to_string()))
@@ -661,10 +679,81 @@ impl VmetteServer {
     ) -> Result<CallToolResult, ErrorData> {
         self.action(
             &args.session_id,
-            json!({ "action": "exec", "command": args.command }),
+            Action::Exec {
+                command: args.command,
+            },
         )
         .await?;
         Ok(ok_text("launched".to_string()))
+    }
+
+    #[tool(
+        description = "Launch a GUI app in the desktop session and return its first painted frame as a screenshot. The one-call way to start an app and see it: it backgrounds the command, waits for the screen to change (the window mapping and drawing) and then settle, and returns that frame. Prefer this over desktop_exec + polling when you want to start something and immediately look at it — e.g. command='chromium https://example.com', 'gimp /mnt/a.png', or 'xterm'. The command runs as given; supply whatever flags the app needs (the desktop image bakes sensible defaults for the browser it ships). Network-dependent apps only reach the network if the session was started with network=true."
+    )]
+    async fn desktop_launch(
+        &self,
+        Parameters(args): Parameters<DesktopLaunchArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        // Record the pre-launch frame as the diff baseline so the readiness
+        // loop can distinguish "the app painted" from "still the bare
+        // desktop". We want only the side effect, so ignore the result.
+        let _ = self.daemon.what_changed(&args.session_id).await;
+
+        // Background the command so the exec returns immediately (the readiness
+        // loop below is what waits for the window, not the exec call), and
+        // redirect its stdio to a guest log so a chatty app can't block on a
+        // full stdout/stderr pipe before it paints.
+        let command = format!(
+            "{} >{LAUNCH_LOG_PATH} 2>&1 &",
+            args.command.trim_end_matches(['&', ' '])
+        );
+        self.action(&args.session_id, Action::Exec { command })
+            .await?;
+
+        // Wait for first paint. A freshly launched app maps a *black* window
+        // that the settle detector reads as "settled; nothing moving", so
+        // settling immediately would hand back a black frame. Instead poll
+        // what_changed until the frame differs from the baseline (window
+        // mapped / started drawing), bounded by wait_ms.
+        let budget = Duration::from_millis(args.wait_ms.unwrap_or(DEFAULT_LAUNCH_TIMEOUT_MS));
+        let deadline = Instant::now() + budget;
+        let mut painted = false;
+        while Instant::now() < deadline {
+            match self.daemon.what_changed(&args.session_id).await {
+                Ok(reply) if reply.changed.is_some() => {
+                    painted = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(e) => return Err(ErrorData::internal_error(e.to_string(), None)),
+            }
+            tokio::time::sleep(Duration::from_millis(LAUNCH_POLL_MS)).await;
+        }
+
+        // Then let the app finish drawing and the screen stop moving, and
+        // return that final frame.
+        let settle = self
+            .daemon
+            .screenshot_when_settled(&args.session_id, Some(LAUNCH_SETTLE_MS))
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        let note = if painted {
+            format!("launched {}", args.command)
+        } else {
+            format!(
+                "ran {:?} but the screen did not change within {}s — did it start? \
+                 (is the binary on PATH in this desktop image, and does it need flags? \
+                 check {} in-guest)",
+                args.command,
+                budget.as_secs(),
+                LAUNCH_LOG_PATH,
+            )
+        };
+        Ok(CallToolResult::success(vec![
+            Content::text(note),
+            Content::image(settle.png_base64, "image/png".to_string()),
+        ]))
     }
 
     #[tool(
@@ -685,7 +774,7 @@ impl VmetteServer {
 impl VmetteServer {
     /// Send one desktop action, surfacing an `ok:false` agent reply as an
     /// error so tools don't silently report success on a failed action.
-    async fn action(&self, session_id: &str, action: Value) -> Result<ActionReply, ErrorData> {
+    async fn action(&self, session_id: &str, action: Action) -> Result<ActionReply, ErrorData> {
         let reply = self
             .daemon
             .action(session_id, action)
@@ -707,15 +796,12 @@ impl VmetteServer {
         session_id: &str,
         x: i32,
         y: i32,
-        click: &str,
+        click: Action,
     ) -> Result<CallToolResult, ErrorData> {
-        self.action(
-            session_id,
-            json!({ "action": "mouse_move", "x": x, "y": y }),
-        )
-        .await?;
-        self.action(session_id, json!({ "action": click })).await?;
-        Ok(ok_text(format!("{click} at {x} {y}")))
+        let label = click_label(&click);
+        self.action(session_id, Action::MouseMove { x, y }).await?;
+        self.action(session_id, click).await?;
+        Ok(ok_text(format!("{label} at {x} {y}")))
     }
 }
 
@@ -770,6 +856,16 @@ fn shell_quoted_python(code: &str) -> String {
 /// Wrap a short status string as a successful single text content block.
 fn ok_text(msg: String) -> CallToolResult {
     CallToolResult::success(vec![Content::text(msg)])
+}
+
+/// Human-readable label for a click action, for the tool's success message.
+fn click_label(a: &Action) -> &'static str {
+    match a {
+        Action::LeftClick => "left_click",
+        Action::DoubleClick => "double_click",
+        Action::RightClick => "right_click",
+        _ => "click",
+    }
 }
 
 fn format_reply(r: &RunReply) -> String {

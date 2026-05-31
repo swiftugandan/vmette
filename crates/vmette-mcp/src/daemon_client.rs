@@ -7,9 +7,10 @@
 //! per-call subprocess. These tools therefore route through `vmetted`'s UNIX
 //! socket, where the session registry holds the live `vmette::Session`.
 //!
-//! Protocol: one request line of JSON in, one reply line of JSON out (the
-//! daemon's stateful `desktop_*` path). We connect fresh per call — the hop
-//! cost is trivial next to a GUI round-trip.
+//! Protocol: one [`DesktopRequest`] line of JSON in, one [`DesktopReply`] line
+//! of JSON out (the daemon's stateful `desktop_*` path). Both are the shared
+//! [`vmette_proto`] wire types, so this client and the daemon cannot drift. We
+//! connect fresh per call — the hop cost is trivial next to a GUI round-trip.
 //!
 //! Zero-config: if nothing is listening on the socket (first desktop use, or
 //! the daemon was never started), [`DaemonClient`] launches a detached
@@ -23,10 +24,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
+use vmette_proto::agent::Action;
+use vmette_proto::daemon::{
+    ActionReply, ChangedReply, DesktopAction, DesktopReply, DesktopRequest,
+    DesktopScreenshotSettled, DesktopStart, DesktopStop, DesktopWhatChanged, SettleReply,
+};
 
 /// Handle to the daemon's desktop subsystem. Cheap to clone.
 #[derive(Debug, Clone)]
@@ -37,43 +42,6 @@ pub struct DaemonClient {
     /// Serializes auto-spawn so concurrent desktop calls don't each fork a
     /// `vmetted`; losers block here, then reuse the winner's socket.
     spawn_lock: Arc<Mutex<()>>,
-}
-
-/// The error/position fields plus optional PNG from a `desktop_action` reply.
-#[derive(Debug)]
-pub struct ActionReply {
-    pub ok: bool,
-    pub error: Option<String>,
-    pub x: Option<i32>,
-    pub y: Option<i32>,
-    /// Base64-encoded PNG (present only for `screenshot`).
-    pub png_base64: Option<String>,
-}
-
-/// A rectangle in pixel coordinates (a moving region or a damage box).
-#[derive(Debug, Clone, Copy)]
-pub struct RectReply {
-    pub x: u32,
-    pub y: u32,
-    pub w: u32,
-    pub h: u32,
-}
-
-/// Reply to `desktop_screenshot_settled`: the settled (or timed-out) frame plus
-/// the regions still moving.
-#[derive(Debug)]
-pub struct SettleReply {
-    pub settled: bool,
-    pub moving: Vec<RectReply>,
-    pub png_base64: String,
-}
-
-/// Reply to `desktop_what_changed`: a fresh frame and the damage box (absent
-/// when nothing changed since the previous capture).
-#[derive(Debug)]
-pub struct ChangedReply {
-    pub changed: Option<RectReply>,
-    pub png_base64: String,
 }
 
 impl DaemonClient {
@@ -97,49 +65,37 @@ impl DaemonClient {
         net: bool,
         offline: bool,
     ) -> Result<String> {
-        let mut req = json!({
-            "kind": "desktop_start",
-            "kernel": self.kernel,
-            "initramfs": self.initramfs,
-            "net": net,
-            "offline": offline,
-        });
-        if let Some(img) = image {
-            req["image"] = json!(img);
+        // `vcpus`/`mem_mib` unset → the daemon applies its desktop defaults.
+        let reply = self
+            .call(&DesktopRequest::DesktopStart(DesktopStart {
+                kernel: self.kernel.clone(),
+                initramfs: self.initramfs.clone(),
+                image,
+                size,
+                net,
+                offline,
+                vcpus: None,
+                mem_mib: None,
+            }))
+            .await?;
+        match reply {
+            DesktopReply::Session(s) => Ok(s.session_id),
+            other => bail!("daemon did not return a session_id: {other:?}"),
         }
-        if let Some(sz) = size {
-            req["size"] = json!(sz);
-        }
-        let reply = self.call(&req).await?;
-        reply
-            .get("session_id")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .ok_or_else(|| anyhow!("daemon did not return a session_id"))
     }
 
-    /// Run one computer-use action against a live session. `action` is the
-    /// `vmette::Action` JSON body (e.g. `{"action":"left_click"}`).
-    pub async fn action(&self, session_id: &str, action: Value) -> Result<ActionReply> {
-        let req = json!({
-            "kind": "desktop_action",
-            "session_id": session_id,
-            "action": action,
-        });
-        let reply = self.call(&req).await?;
-        Ok(ActionReply {
-            ok: reply.get("ok").and_then(Value::as_bool).unwrap_or(false),
-            error: reply
-                .get("error")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            x: reply.get("x").and_then(Value::as_i64).map(|v| v as i32),
-            y: reply.get("y").and_then(Value::as_i64).map(|v| v as i32),
-            png_base64: reply
-                .get("png_base64")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-        })
+    /// Run one computer-use action against a live session.
+    pub async fn action(&self, session_id: &str, action: Action) -> Result<ActionReply> {
+        let reply = self
+            .call(&DesktopRequest::DesktopAction(DesktopAction {
+                session_id: session_id.to_string(),
+                action,
+            }))
+            .await?;
+        match reply {
+            DesktopReply::ActionResult(r) => Ok(r),
+            other => bail!("unexpected reply to desktop_action: {other:?}"),
+        }
     }
 
     /// Poll the desktop until it settles (or `timeout_ms` elapses) and return
@@ -149,58 +105,46 @@ impl DaemonClient {
         session_id: &str,
         timeout_ms: Option<u64>,
     ) -> Result<SettleReply> {
-        let mut req = json!({
-            "kind": "desktop_screenshot_settled",
-            "session_id": session_id,
-        });
-        if let Some(ms) = timeout_ms {
-            req["timeout_ms"] = json!(ms);
+        let reply = self
+            .call(&DesktopRequest::DesktopScreenshotSettled(
+                DesktopScreenshotSettled {
+                    session_id: session_id.to_string(),
+                    timeout_ms,
+                },
+            ))
+            .await?;
+        match reply {
+            DesktopReply::Settled(s) => Ok(s),
+            other => bail!("unexpected reply to desktop_screenshot_settled: {other:?}"),
         }
-        let reply = self.call(&req).await?;
-        let moving = reply
-            .get("moving")
-            .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(parse_rect).collect())
-            .unwrap_or_default();
-        Ok(SettleReply {
-            settled: reply
-                .get("settled")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            moving,
-            png_base64: reply
-                .get("png_base64")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .ok_or_else(|| anyhow!("settle reply missing png_base64"))?,
-        })
     }
 
     /// Capture one frame and report what changed since this session's previous
     /// capture.
     pub async fn what_changed(&self, session_id: &str) -> Result<ChangedReply> {
-        let req = json!({ "kind": "desktop_what_changed", "session_id": session_id });
-        let reply = self.call(&req).await?;
-        Ok(ChangedReply {
-            changed: reply.get("changed").and_then(parse_rect),
-            png_base64: reply
-                .get("png_base64")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .ok_or_else(|| anyhow!("what_changed reply missing png_base64"))?,
-        })
+        let reply = self
+            .call(&DesktopRequest::DesktopWhatChanged(DesktopWhatChanged {
+                session_id: session_id.to_string(),
+            }))
+            .await?;
+        match reply {
+            DesktopReply::Changed(c) => Ok(c),
+            other => bail!("unexpected reply to desktop_what_changed: {other:?}"),
+        }
     }
 
     /// Tear a session down.
     pub async fn stop(&self, session_id: &str) -> Result<()> {
-        let req = json!({ "kind": "desktop_stop", "session_id": session_id });
-        self.call(&req).await?;
+        self.call(&DesktopRequest::DesktopStop(DesktopStop {
+            session_id: session_id.to_string(),
+        }))
+        .await?;
         Ok(())
     }
 
-    /// Send one request line, read one reply line, and map a `kind:"error"`
-    /// reply to an `Err`.
-    async fn call(&self, req: &Value) -> Result<Value> {
+    /// Send one request line, read one reply line, and map a
+    /// [`DesktopReply::Error`] reply to an `Err`.
+    async fn call(&self, req: &DesktopRequest) -> Result<DesktopReply> {
         let stream = self.connect().await?;
         let (read_half, mut write_half) = stream.into_split();
 
@@ -218,17 +162,12 @@ impl DaemonClient {
         if reply.is_empty() {
             bail!("daemon closed the connection without replying");
         }
-        let value: Value =
+        let value: DesktopReply =
             serde_json::from_str(reply).with_context(|| format!("bad reply: {reply}"))?;
-
-        if value.get("kind").and_then(Value::as_str) == Some("error") {
-            let msg = value
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown error");
-            bail!("{msg}");
+        match value {
+            DesktopReply::Error(e) => bail!("{}", e.message),
+            other => Ok(other),
         }
-        Ok(value)
     }
 
     /// Connect to the daemon socket, lazily starting `vmetted` if nothing is
@@ -317,17 +256,6 @@ fn locate_vmetted() -> Option<PathBuf> {
         }
     }
     None
-}
-
-/// Parse a `{x,y,w,h}` rect object from a reply (all four fields required).
-fn parse_rect(v: &Value) -> Option<RectReply> {
-    let f = |k: &str| v.get(k).and_then(Value::as_u64).map(|n| n as u32);
-    Some(RectReply {
-        x: f("x")?,
-        y: f("y")?,
-        w: f("w")?,
-        h: f("h")?,
-    })
 }
 
 fn default_socket() -> PathBuf {
