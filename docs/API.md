@@ -43,6 +43,24 @@ fn main() -> Result<(), vmette::Error> {
 }
 ```
 
+### Boot assets
+
+`Config::new(kernel, initramfs)` takes paths to a Linux kernel
+(`vmlinuz-virt`) and vmette's repacked initramfs (`initramfs-vmette`).
+These are **not distributed on crates.io** — the crate is the code, not the
+~10 MB boot blobs. A library consumer obtains them one of two ways:
+
+- **From a release:** download `vmlinuz-virt` + `initramfs-vmette` from a
+  [GitHub release](https://github.com/chamuka-inc/vmette/releases) tarball
+  (they live under `assets/`), and pass their paths to `Config::new`.
+- **From a checkout:** `git clone https://github.com/chamuka-inc/vmette && make assets init`
+  writes `assets/vmlinuz-virt` + `assets/initramfs-vmette`.
+
+If you place them in a conventional location, the `vmette-assets` crate can
+discover them for you — `vmette_assets::find("vmlinuz-virt")` searches
+`$VMETTE_ASSETS_DIR`, then `./assets`, then the install prefix — so you can
+feed `Config::new` without hard-coding paths. Guest assets are x86_64-only.
+
 ### Types
 
 See [`crates/vmette/src/lib.rs`](../crates/vmette/src/lib.rs).

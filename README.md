@@ -253,9 +253,18 @@ screenshot, click, type — the way a computer-use agent expects. A
 headless X server (Xvfb) + window manager run in the guest, driven by an
 in-guest agent over vsock; no Apple graphics window is involved.
 
+> **Prerequisite — the desktop rootfs image.** Unlike the headless paths, the
+> desktop needs a Debian-slim image (Xvfb + openbox + the agent) that does
+> **not** ship in the install tarball. From a source checkout, build it with
+> `make desktop-image` (needs Docker; builds `linux/amd64` since the guest is
+> x86_64-only) → it lands at `assets/vmette-desktop-rootfs.tar` and is
+> auto-discovered. Resolution order: `--image` → `$VMETTE_DESKTOP_IMAGE` →
+> `assets/vmette-desktop-rootfs.tar` → the `ghcr.io/chamuka-inc/vmette-desktop`
+> registry fallback. The headless CLI / MCP tools above do not need this.
+
 ```sh
 vmetted &                                    # sessions live in the daemon
-bash scripts/build-desktop-image.sh          # build the desktop rootfs image
+make desktop-image                           # build the desktop rootfs (Docker; from a checkout)
 
 SID=$(vmette desktop start)
 vmette desktop screenshot "$SID" --out shot.png && open shot.png
