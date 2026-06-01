@@ -337,9 +337,10 @@ if [ -z "$B64" ]; then
     RC=$?
 else
     log "exec: $USER_CMD"
-    # Source the image's env (PATH etc., written by the OCI provider) if present,
-    # then run the user command. $USER_CMD is passed as a positional arg so it
-    # needs no re-escaping here.
+    # Source the image's env (PATH etc.) if present, then run the user command.
+    # `/.vmette-image-env` is written by vmette-provider-oci's write_image_env()
+    # — keep the filename in sync with that crate. $USER_CMD is passed as a
+    # positional arg so it needs no re-escaping here.
     chroot /newroot /bin/sh -c '[ -r /.vmette-image-env ] && . /.vmette-image-env 2>/dev/null; exec /bin/sh -c "$1"' vmette "$USER_CMD"
     RC=$?
     log "exit=$RC"

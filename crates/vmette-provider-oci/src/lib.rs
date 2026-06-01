@@ -602,6 +602,11 @@ pub async fn pull_with_options(
 /// write failure is silently ignored (the env is a convenience, not required).
 fn write_image_env(rootfs: &Path, config_blob: &[u8]) {
     if let Some(out) = render_image_env(config_blob) {
+        // The filename is a cross-language contract: the guest PID-1
+        // (scripts/custom-init.sh) sources `/.vmette-image-env` before the
+        // exec. Renaming one side without the other silently drops the image
+        // env. Env is an OCI-image-config concept, so only this provider writes
+        // it — dir/tar/squashfs rootfses carry no Env.
         let _ = std::fs::write(rootfs.join(".vmette-image-env"), out);
     }
 }
@@ -622,7 +627,18 @@ fn render_image_env(config_blob: &[u8]) -> Option<String> {
         let Some((key, val)) = entry.as_str().and_then(|kv| kv.split_once('=')) else {
             continue;
         };
-        if key.is_empty() || !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        // POSIX shell identifier: first char `[A-Za-z_]`, rest `[A-Za-z0-9_]`.
+        // A leading digit (e.g. `1FOO`) would render an `export` line the guest
+        // shell rejects, so drop it rather than emit a line that errors on source.
+        let mut bytes = key.bytes();
+        let valid = match bytes.next() {
+            Some(first) => {
+                (first.is_ascii_alphabetic() || first == b'_')
+                    && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            }
+            None => false,
+        };
+        if !valid {
             continue;
         }
         let escaped = val.replace('\'', "'\\''");
@@ -857,12 +873,16 @@ mod tests {
 
     #[test]
     fn image_env_renders_exports_and_escapes() {
-        let blob = br#"{"config":{"Env":["PATH=/usr/local/cargo/bin:/bin","RUST_VERSION=1.96.0","BAD KEY=x","WEIRD=it's"]}}"#;
+        let blob = br#"{"config":{"Env":["PATH=/usr/local/cargo/bin:/bin","RUST_VERSION=1.96.0","BAD KEY=x","1LEAD=x","WEIRD=it's","HAS=a=b"]}}"#;
         let out = render_image_env(blob).expect("some env");
         assert!(out.contains("export PATH='/usr/local/cargo/bin:/bin'\n"));
         assert!(out.contains("export RUST_VERSION='1.96.0'\n"));
-        // Non-identifier key is dropped.
+        // split_once keeps `=` in the value.
+        assert!(out.contains("export HAS='a=b'\n"));
+        // Non-identifier keys are dropped: a space, and a leading digit (an
+        // invalid shell identifier the guest would reject on source).
         assert!(!out.contains("BAD KEY"));
+        assert!(!out.contains("1LEAD"));
         // Single quotes in the value are escaped so sourcing stays inert.
         assert!(out.contains(r"export WEIRD='it'\''s'"));
     }
