@@ -4,6 +4,7 @@
 vmette --rootfs SPEC [--kernel PATH] [--initramfs PATH] [options]
 vmette providers                                # list registered providers
 vmette desktop <command> [options]              # drive a persistent desktop session
+vmette --version                                # print version (also -V)
 ```
 
 ## Required
