@@ -407,6 +407,10 @@ fn main() -> ExitCode {
     // Sub-commands take precedence over the run flow.
     let mut argv = std::env::args().skip(1);
     if let Some(first) = argv.next() {
+        if first == "--version" || first == "-V" || first == "version" {
+            println!("vmette {}", env!("CARGO_PKG_VERSION"));
+            return ExitCode::SUCCESS;
+        }
         if first == "providers" {
             print_providers(&default_registry());
             return ExitCode::SUCCESS;

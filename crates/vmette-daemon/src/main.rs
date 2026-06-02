@@ -154,10 +154,14 @@ async fn main() -> Result<()> {
         match a.as_str() {
             "--socket" => socket = args.next().context("--socket needs PATH")?.into(),
             "--vmette" => vmette_bin = args.next().context("--vmette needs PATH")?.into(),
+            "--version" | "-V" => {
+                println!("vmetted {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
             "-h" | "--help" => {
                 eprintln!(
                     "vmetted — UNIX socket dispatcher for vmette\n\n\
-                     usage: vmetted [--socket PATH] [--vmette PATH]\n\n\
+                     usage: vmetted [--socket PATH] [--vmette PATH] [--version]\n\n\
                      defaults:\n  \
                        --socket  $HOME/Library/Caches/vmette/vmette.sock\n  \
                        --vmette  (next to vmetted, or PATH lookup)\n"

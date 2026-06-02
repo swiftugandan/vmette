@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`--version` / `-V` on all three binaries** (`vmette`, `vmetted`,
+  `vmette-mcp`) — prints `<name> <version>` and exits 0.
+
 ## [0.4.0] — 2026-06-02
 
 ### Added

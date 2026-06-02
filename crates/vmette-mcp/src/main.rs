@@ -60,7 +60,8 @@ fn usage() -> ! {
            --initramfs PATH      override autodiscovered initramfs path\n  \
            --vmette PATH         override autodiscovered `vmette` binary path\n  \
            --socket PATH         vmetted socket for desktop_* tools (default ~/Library/Caches/vmette/vmette.sock)\n  \
-           -h, --help            this message\n\n\
+           -h, --help            this message\n  \
+           -V, --version         print version and exit\n\n\
          the server speaks MCP over stdio; configure your client to launch this binary.\n"
     );
     std::process::exit(2);
@@ -118,6 +119,10 @@ fn parse_args() -> Args {
             "--socket" => {
                 a.daemon_socket = Some(take(i, "--socket").into());
                 i += 2;
+            }
+            "--version" | "-V" => {
+                println!("vmette-mcp {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
             }
             "-h" | "--help" => usage(),
             other => {
