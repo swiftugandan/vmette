@@ -1,6 +1,16 @@
 SHELL := /bin/bash
 
-.PHONY: help build header universal dist publish release assets init guest-bin guest-assets-all desktop-agent desktop-agent-all desktop-image run shell test test-desktop test-view clean
+.PHONY: help build dev guest-stale-check header universal dist publish release assets init guest-bin guest-assets-all desktop-agent desktop-agent-all desktop-image run shell test test-desktop test-view clean
+
+# Host guest arch + the guest-side artifacts whose freshness `build`/`dev` check.
+# These are produced by `make init` / `make desktop-agent`, NOT by `make build`
+# (which only compiles + signs the host binaries), so a guest boot can silently
+# use a stale initramfs or a missing agent. guest-stale-check turns those latent
+# failures (kernel panic / "vsock unavailable: agent stream closed") into a loud
+# build-time reminder.
+GUEST_ARCH := $(shell . scripts/guest-arch.sh && vmette_guest_arch)
+INITRAMFS  := assets/$(GUEST_ARCH)/initramfs-vmette
+AGENT_DIR  := assets/$(GUEST_ARCH)/desktop-agent
 
 help:
 	@awk -F':.*##' '/^[a-zA-Z_-]+:.*##/ { printf "  %-12s %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
@@ -12,6 +22,24 @@ build:         ## cargo build the workspace + codesign vmette/vmetted/vmette-mcp
 	# vmette-mcp boots one-shot VMs in-process (execute/fetch_url/workspace), so it
 	# needs the virtualization entitlement too — it no longer forks the vmette CLI.
 	codesign --sign - --force --entitlements entitlements.plist --options=runtime target/release/vmette-mcp
+	@$(MAKE) --no-print-directory guest-stale-check
+
+dev:           ## Full live-test prep: build + sign host bins AND rebuild the guest initramfs + desktop agent
+	$(MAKE) build
+	$(MAKE) init
+	$(MAKE) desktop-agent
+
+guest-stale-check: ## Warn (non-fatally) when the guest initramfs/desktop agent are stale vs their sources
+	@if [ ! -f "$(INITRAMFS)" ]; then \
+	    echo "⚠ $(INITRAMFS) missing — run 'make init' before booting a guest"; \
+	elif [ scripts/custom-init.sh -nt "$(INITRAMFS)" ] || [ scripts/build-initramfs.sh -nt "$(INITRAMFS)" ]; then \
+	    echo "⚠ $(INITRAMFS) is older than its sources — run 'make init' (a stale initramfs panics or drops to a shell)"; \
+	fi
+	@if [ ! -x "$(AGENT_DIR)/vmette-desktop-agent" ]; then \
+	    echo "⚠ $(AGENT_DIR) missing — run 'make desktop-agent' before a desktop session (else the daemon falls back to a stale in-image agent)"; \
+	elif [ guest/vmette-desktop-agent.c -nt "$(AGENT_DIR)/vmette-desktop-agent" ]; then \
+	    echo "⚠ $(AGENT_DIR) is older than guest/vmette-desktop-agent.c — run 'make desktop-agent'"; \
+	fi
 
 header:        ## Regenerate the checked-in C header from src/ffi.rs (cbindgen)
 	cargo build -p vmette --features regenerate-header

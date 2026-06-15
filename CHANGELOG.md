@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `make dev` builds and signs the host binaries **and** rebuilds the guest-side
+  artifacts (`make init` + `make desktop-agent`) in one step — the full live-test
+  prep. `make build` now ends with a non-fatal `guest-stale-check` (also runnable
+  on its own) that warns when `assets/<arch>/initramfs-vmette` is missing or older
+  than `scripts/custom-init.sh`/`scripts/build-initramfs.sh`, or when
+  `assets/<arch>/desktop-agent/` is missing or older than
+  `guest/vmette-desktop-agent.c`. A stale initramfs or missing agent otherwise
+  surfaces only at boot as a guest kernel panic or `vsock unavailable: agent
+  stream closed`; the check turns that into a build-time reminder.
+
 - Desktop drag-and-drop now works on gesture-gated targets (pivot-table layout,
   list reordering, sliders, file managers). The guest agent's `left_click_drag`
   previously did a single press → jump → release, which DnD targets read as a
@@ -73,14 +83,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
-- The repo no longer builds or publishes the desktop rootfs image. The
-  `make desktop-image` target, `scripts/build-desktop-image.sh`, and the
-  `desktop-image.yml` CI workflow are gone. Because the computer-use agent is now
-  host-injected, a vmette-specific image isn't required — `desktop start` defaults
-  to the (frozen) published `ghcr.io/chamuka-inc/vmette-desktop:latest` and you
-  customize by bringing your own GUI rootfs (`--image` / `$VMETTE_DESKTOP_IMAGE`).
-  The reference recipe stays in `images/vmette-desktop/` for forking. No runtime
-  behavior change: the default desktop still works with no setup.
+- The desktop rootfs image is no longer auto-published by CI: the
+  `desktop-image.yml` GitHub Actions workflow is gone and the published
+  `ghcr.io/chamuka-inc/vmette-desktop:latest` is now frozen. Because the
+  computer-use agent is now host-injected, a vmette-specific image isn't required
+  — `desktop start` defaults to that published image and you customize by bringing
+  your own GUI rootfs (`--image` / `$VMETTE_DESKTOP_IMAGE`). The local build path
+  is retained for forking and republishing (`make desktop-image` /
+  `scripts/build-desktop-image.sh`), and the reference recipe stays in
+  `images/vmette-desktop/`. No runtime behavior change: the default desktop still
+  works with no setup.
 
 ### Fixed
 
