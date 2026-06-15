@@ -9,18 +9,15 @@ network. vmette gives that work somewhere safe to happen instead: a real,
 hardware-isolated Linux VM that boots in ~1 second, sees only what you share in,
 and disappears when it's done. Send the agent's untrusted work there — or lock
 the agent down so the VM is its *only* way to run code — and nothing it executes
-can reach your files, tokens, or network. Your code and secrets never leave the
-device.
+ever touches your real machine.
 
 <p align="center">
   <img src="vmette-demo.gif" alt="vmette booting a Linux guest, propagating its exit code to the host, and enforcing default-deny networking until --net is passed" width="800">
 </p>
 
 It's built on Apple's `Virtualization.framework`: the boundary is a hypervisor with
-its own kernel, not a container sharing yours. Default-deny — no host filesystem and
-no network until you explicitly grant them. Ephemeral — each run is a fresh guest, so
-nothing persists. And it's a Model Context Protocol server, so any MCP-aware agent
-host gets a sandboxed machine with one line of config.
+its own kernel, not a container sharing yours. And it's a Model Context Protocol
+server, so any MCP-aware agent host gets a sandboxed machine with one line of config.
 
 ## Why on-device
 
@@ -33,11 +30,8 @@ host gets a sandboxed machine with one line of config.
 | Cost                 | usage-metered (per-second / CPU)    | free                   | **free, on-device**                 |
 | Boot time            | sub-second + a network round-trip   | ~sub-second            | **~1 second, local**                |
 
-The cloud sandboxes are fast and well-isolated — they boot the same kind of microVM in
-milliseconds. The catch isn't speed; it's that the work runs on someone else's machine,
-reached over the network, with a usage meter running across a long agent loop. A
-container is local and free but shares your kernel — one namespace away from the host.
-vmette is the on-device option that keeps the real isolation without the round-trip.
+The cloud sandboxes are just as well-isolated — the difference is keeping that
+isolation on-device: no round-trip, no meter.
 
 ## Install
 
@@ -45,8 +39,9 @@ vmette is the on-device option that keeps the real isolation without the round-t
 curl -fsSL https://github.com/chamuka-inc/vmette/releases/latest/download/install.sh | bash
 ```
 
-Installs to `~/.local/share/vmette/`, symlinks `~/.local/bin/{vmette,vmetted,vmette-mcp}`.
-macOS-only (any version with VZ — i.e. 11+; tested on 14.7 Intel).
+Installs to `~/.local/share/vmette/` (the C ABI lands at `lib/libvmette.dylib` +
+`include/vmette.h` there), symlinks `~/.local/bin/{vmette,vmetted,vmette-mcp}`.
+macOS-only (requires Apple's Virtualization.framework).
 
 <details>
 <summary>Or build from source</summary>
@@ -62,13 +57,11 @@ make test               # cargo unit + end-to-end VM smoke
 ## Give your agent a sandbox (MCP)
 
 `vmette-mcp` is a Model Context Protocol server that hands any MCP-aware agent host a
-sandboxed machine as a set of tools (`execute`, `workspace_*`, `desktop_*`). Work the
-agent runs *through these tools* happens inside the VM — never on your host filesystem
-(unless you share a directory in), with no network egress (unless you start the server
-with `--allow-network`). Note it *adds* the sandbox alongside the host's own tools; in
-Claude Code the agent still has native Bash that runs on your Mac, so to make the VM
-its *only* way to run code, restrict those too (e.g. deny the Bash tool). See
-[`docs/MCP.md`](docs/MCP.md).
+sandboxed machine as a set of tools (`execute`, `fetch_url`, `workspace_*`, `desktop_*`). Work the
+agent runs *through these tools* happens inside the VM, confined as above. Note it
+*adds* the sandbox alongside the host's own tools; in Claude Code the agent still has
+native Bash that runs on your Mac, so to make the VM its *only* way to run code, restrict
+those too (e.g. deny the Bash tool).
 
 **Claude Code** — one command, no config file:
 
@@ -88,11 +81,12 @@ command. JSON example (Claude Desktop's
 }}}
 ```
 
-The server ships an `execute` tool, `fetch_url`, a `workspace_*` family (each call
-boots a fresh microVM), and a `desktop_*` family for computer use.
+Each `execute` and `workspace_run` call boots a fresh microVM; a workspace is a
+persistent host directory mounted into each run, so files survive across calls
+(`workspace_create`/`write`/`read`/`destroy` are host-side directory ops).
 
-Per-host setup snippets (Claude Code, Claude Desktop, Cursor, Cline, Zed, Goose) plus
-the full tool reference and security model: [`docs/MCP.md`](docs/MCP.md).
+Full tool reference, per-host configs, and the security model:
+[`docs/MCP.md`](docs/MCP.md).
 
 ## Give your agent a desktop (computer use)
 
@@ -120,16 +114,10 @@ agent share one display. The same capability is exposed to agents through the MC
 `desktop_*` tools (`desktop_screenshot` returns a PNG image block).
 
 > **The desktop rootfs.** The desktop needs a GUI rootfs — an X server (Xvfb) and a
-> window manager — separate from the headless paths. You don't have to build anything:
-> `vmette desktop start` pulls the published default image from
-> `ghcr.io/chamuka-inc/vmette-desktop` automatically on first use (then cached under
-> `~/Library/Caches/vmette/oci/`), so the MCP and CLI desktop paths work out of the
-> box — no Docker needed. The computer-use agent is host-injected (a static binary
-> vmette ships), so any GUI image works: bring your own with `--image <ref>` /
-> `$VMETTE_DESKTOP_IMAGE`, or drop a `vmette-desktop-rootfs.tar` in `assets/<arch>/`.
-> Resolution order: `--image` → `$VMETTE_DESKTOP_IMAGE` → local
-> `assets/<arch>/vmette-desktop-rootfs.tar` → the published
-> `ghcr.io/chamuka-inc/vmette-desktop` image. See `docs/DESKTOP.md`.
+> window manager. You don't have to build one: `vmette desktop start` auto-pulls the
+> published default on first use (no Docker), and the computer-use agent is
+> host-injected (a static binary vmette ships), so any GUI image works. See
+> [`docs/DESKTOP.md`](docs/DESKTOP.md) for the resolution order and bring-your-own recipe.
 
 See [`docs/DESKTOP.md`](docs/DESKTOP.md) for the session lifecycle, protocol, action
 reference, and image build.
@@ -147,7 +135,7 @@ vmette --rootfs python:3.12-alpine \
 The exit code propagates to the host. The kernel and initramfs are auto-discovered
 (the release tarball ships them under `$PREFIX/assets`; from a checkout vmette finds
 `./assets`). Override with `--kernel` / `--initramfs` or `$VMETTE_ASSETS_DIR`. First
-run pulls + extracts the image (alpine:3.20 ≈ 30 s); subsequent runs are cache hits
+run pulls + extracts the image (python:3.12-alpine ≈ 30 s); subsequent runs are cache hits
 (~3 s), cached at `~/Library/Caches/vmette/oci/`.
 
 One `--rootfs` flag, four sources — a local directory, an OCI ref, a tarball URL, or a
@@ -164,7 +152,7 @@ vmette --rootfs squashfs+file:///tmp/base.sqfs      --exec 'ls /'
 
 Network is off until you ask (`--net`), virtio-fs shares only the host dirs you name,
 and the rootfs can attach read-only. Private OCI registries authenticate via env vars
-or `~/.docker/config.json` (`VMETTE_OCI_TOKEN`). Full flag list: `vmette --help` or
+or `~/.docker/config.json` (`VMETTE_OCI_AUTH_<HOST>=user:secret` or `VMETTE_OCI_TOKEN`). Full flag list: `vmette --help` or
 [`docs/CLI.md`](docs/CLI.md).
 
 The writable root is a RAM-backed overlay by default, so a heavy build or extract can
@@ -181,10 +169,13 @@ vmette --rootfs rust:1.80 --net --mem-mib 1024 --scratch 8G \
 
 1. `vmette` builds a `VZVirtualMachineConfiguration` (kernel, initramfs, virtio
    devices, vsock).
-2. The kernel command line carries `vmette.exec=<base64(cmd)>` plus `vmette.*` flags.
-   The guest's `/init` ([`scripts/custom-init.sh`](scripts/custom-init.sh)) parses
-   them in pure shell, mounts virtio-fs shares, brings up the network if requested,
-   then `chroot` / `switch_root` into the rootfs and runs the command.
+2. The kernel command line carries only `vmette.boot=ctl` (plus `vmette.vsock_port`
+   when vsock is on). Everything per-invocation — exec (base64 as `VMETTE_EXEC_B64`),
+   env, rootfs mode, shares, scratch device, switch-root, and net — travels in a typed
+   `boot.env` envelope written to a `ctl` virtio-fs share. The guest's `/init`
+   ([`scripts/custom-init.sh`](scripts/custom-init.sh)) sources that envelope in pure
+   shell, mounts virtio-fs shares, brings up the network if requested, then `chroot` /
+   `switch_root` into the rootfs and runs the command.
 3. After the command exits, the guest writes the code to `.vmette-exit`, syncs, and
    `poweroff -f`. VZ fires the lifecycle delegate; the host reads the file and exits
    with that code.
@@ -204,19 +195,16 @@ The library accepts a directory path; resolution from a spec (OCI ref, tarball U
 goes through the provider registry first.
 
 ```rust
-use vmette::provider::{Context, DirProvider, Registry};
+use vmette::provider::Context;
 use vmette::Config;
-use vmette_provider_oci::OciProvider;
-use vmette_provider_squashfs::SquashfsProvider;
-use vmette_provider_tar::TarProvider;
 
 fn main() {
-    let registry = Registry::new()
-        .with(DirProvider::new())
-        .with(SquashfsProvider::new())
-        .with(TarProvider::new())
-        .with(OciProvider::new());
-    let ctx = Context::new(std::env::var_os("HOME").unwrap_or_default());
+    // The standard registry, in the load-bearing resolution order the CLI and
+    // daemon use. To customize, hand-build one instead:
+    //   use vmette::provider::{DirProvider, Registry};
+    //   Registry::new().with(DirProvider::new()).with(/* … */);
+    let registry = vmette_providers::default_registry();
+    let ctx = Context::new(vmette_assets::default_cache_root()); // $HOME/Library/Caches/vmette
     let artifact = registry.resolve("alpine:3.20", &ctx).unwrap();
 
     let mut cfg = Config::new("./assets/aarch64/vmlinuz-virt", "./assets/aarch64/initramfs-vmette");
@@ -230,10 +218,9 @@ fn main() {
 
 ```toml
 [dependencies]
-vmette                   = "0.2"
-vmette-provider-oci      = "0.2"
-vmette-provider-tar      = "0.2"  # optional
-vmette-provider-squashfs = "0.2"  # optional
+vmette           = "0.10"
+vmette-providers = "0.10"  # default_registry(); pulls in the oci/tar/squashfs providers
+vmette-assets    = "0.10"  # default_cache_root() + boot-asset discovery helpers
 ```
 
 See [`crates/vmette/examples/minimal.rs`](crates/vmette/examples/minimal.rs) and
@@ -276,7 +263,8 @@ vmetted &
 ```
 
 Listens on `~/Library/Caches/vmette/vmette.sock`. Speaks line-delimited JSON: client
-sends one request object, daemon streams `stdout` / `stderr` / `exit` frames. Useful
+sends one request object, daemon streams `stdout` frames (guest stdout and stderr
+combined) followed by a terminal `exit` frame. Useful
 for amortizing per-invocation cost or driving many runs from a long-lived caller; it
 also owns the stateful desktop session registry and the live VNC view.
 

@@ -6,19 +6,12 @@ move/click/type, screenshot again. This is the opposite of the headless
 one-shot path — the VM stays alive across many actions until you explicitly
 stop it.
 
-The relief is the same as the rest of vmette: a computer-use agent gets its own
-real desktop to click around in that is *not* your machine. The boundary is the
-hypervisor, the screen the agent sees and the input it injects stay inside the
-guest, and it reaches your host filesystem or network only where you explicitly
-grant it.
-
-Each session is also isolated **from every other session**: the desktop rootfs
-is mounted read-only on the host and overlaid with a per-session tmpfs in the
-guest, so anything a session writes — browser profile and cache, cookies,
-downloads, `/etc` edits — lives only in that session and is discarded when it
-stops. Two sessions never see each other's state, and nothing persists across a
-daemon restart. (Explicit `--share`/share mounts are the deliberate exception:
-those are writable and shared with the host because you asked for them.)
+A computer-use agent gets its own real desktop that is *not* your machine: the
+desktop rootfs is mounted read-only and overlaid with a per-session tmpfs in the
+guest, so everything a session writes is discarded when it stops. The boundary is
+the hypervisor. The CLI and MCP expose no `--share` for desktop sessions; the
+only host grant they wire in is the read-only `--ca-certs` mount (with a
+machine-wide fallback, also read-only).
 
 There is no Apple graphics window involved. The guest runs a headless X server
 (`Xvfb :99`) plus a lightweight window manager (`openbox`), and a C agent
@@ -27,9 +20,8 @@ input with `XTEST`. The agent speaks a small framed protocol over **vsock** —
 the same bidirectional channel vmette already wires up — so no network and no
 display server on the host are required.
 
-The agent itself is supplied by **vmette** (a per-arch static binary it injects
-into the guest), not baked into the rootfs — so the desktop runs on any image
-that provides an X server + a window manager. See
+The agent itself is supplied by **vmette**, not baked into the rootfs, so the
+desktop runs on any image with an X server + a window manager — see
 [Bring your own desktop rootfs](#bring-your-own-desktop-rootfs).
 
 ## Architecture
@@ -50,13 +42,17 @@ strategy; desktop is purely additive and never touches the headless fast path.
 Sessions are owned by **vmetted**, not by the client connection that created
 them (each connection is one request). A session therefore outlives its creating
 connection and is freed only by `desktop_stop`, idle eviction, or daemon
-shutdown. The daemon caps concurrent sessions (each is a ~2 GB VM) and evicts
-sessions left untouched for longer than the idle TTL (30 min).
+shutdown. The daemon caps concurrent sessions (each is a live VM — see
+[Constraints](#constraints) for the default size) and evicts sessions left
+untouched for longer than the idle TTL (30 min).
 
 ## Prerequisites
 
-1. **The daemon must be running.** All desktop access (CLI and MCP) routes
-   through `vmetted`:
+1. **The daemon.** All desktop access (CLI and MCP) routes through `vmetted`,
+   but you don't normally start it yourself: both clients auto-spawn it on
+   first desktop access (the CLI on the default socket, the MCP server always).
+   Run it manually only when you point `--socket` at a daemon you manage
+   yourself:
 
    ```sh
    vmetted &
@@ -67,56 +63,34 @@ sessions left untouched for longer than the idle TTL (30 min).
    automatically on first use (the image is public). The first `desktop start`
    extracts it and caches it under `~/Library/Caches/vmette/oci/`; later starts
    are cache hits. That image is a convenience default (Xvfb + openbox + chromium
-   + fonts) — **this repo no longer builds it**; the agent is host-injected (see
-   [Bring your own desktop rootfs](#bring-your-own-desktop-rootfs)), so any GUI
-   image works and you customize by bringing your own, not by rebuilding ours.
+   + fonts); the usual path is to bring your own GUI image rather than rebuild
+   ours, see [Bring your own desktop rootfs](#bring-your-own-desktop-rootfs).
 
    **Resolution order** (client-side, in `vmette` and `vmette-mcp`, mirroring how
    kernel/initramfs are resolved):
 
    1. explicit `--image REF` (CLI) / `image` arg (MCP) — wins
-   2. `$VMETTE_DESKTOP_IMAGE` (any rootfs spec, e.g. a `tar+file://` or OCI ref)
+   2. `$VMETTE_DESKTOP_IMAGE` (any rootfs spec, e.g. a `tar+file://` or OCI ref) —
+      read from the **client** process (your shell for `vmette desktop start`, the
+      `vmette-mcp` server for `desktop_start`), not the daemon
    3. a locally-provided `assets/<arch>/vmette-desktop-rootfs.tar` (e.g. a
       `docker export` of your own GUI image) → `tar+file://…`
    4. `ghcr.io/chamuka-inc/vmette-desktop:latest` — the published default when no
       local asset is present
 
-   Because resolution is client-side, `$VMETTE_DESKTOP_IMAGE` is read from the
-   **client** process (your shell for `vmette desktop start`, the `vmette-mcp`
-   server for `desktop_start`) — not the daemon.
-
    **No Docker needed to run.** vmette never shells out to Docker — its OCI
    provider is a self-contained registry client, so the published default works
-   out of the box on a machine without Docker. The reference recipe for that
-   image (and a starting point for your own) lives in `images/vmette-desktop/`
-   (`Dockerfile` + `entrypoint.sh` + `vmette-open`): `xvfb`, `openbox`,
-   `x11-utils`, fonts, `chromium` with an `/etc/chromium.d/` flags file (so a
-   bare `chromium <url>` renders under the headless software-GL guest:
-   `--no-sandbox`, `--use-gl=swiftshader`, `--start-maximized`, …).
-
-   **Building the image is optional** (Docker required) — only to customize the
-   rootfs or republish the default. `scripts/build-desktop-image.sh` wraps it:
-
-   ```sh
-   make desktop-image                          # → assets/<arch>/vmette-desktop-rootfs.tar (local, host arch)
-   scripts/build-desktop-image.sh --export     # same, explicit
-   scripts/build-desktop-image.sh --tag my-registry/my-desktop:latest --push   # publish your own
-   scripts/build-desktop-image.sh --push       # republish the default — full amd64+arm64 manifest
-   ```
-
-   A bare `--push` always rebuilds **both** architectures into one manifest
-   (arm64 builds under qemu, bundled with Docker Desktop), so a publish can never
-   leave one arch stale. `--export` (the `make` target) writes the local
-   `tar+file://` rootfs the CLI/MCP auto-discover ahead of the registry default.
+   out of the box on a machine without Docker. Building or customizing that image
+   (Docker required) is covered in
+   [Bring your own desktop rootfs](#bring-your-own-desktop-rootfs).
 
 ## Bring your own desktop rootfs
 
-The computer-use agent is **not** part of the rootfs image — vmette ships it and
-injects it at boot. So a desktop session runs on **any** rootfs that provides an
-**X server (`Xvfb`)** and a **window manager**; that is the entire contract. The
-bundled `vmette-desktop` image is just one convenient such rootfs (it also adds
-Chromium + fonts); you can equally point `--image` at a stock `debian + xvfb +
-openbox` image, your own GUI image, or an OCI ref:
+Because the agent is host-injected (see [Prerequisites](#prerequisites) #2), the
+entire contract a desktop rootfs must satisfy is an **X server (`Xvfb`)** and a
+**window manager**. So you can point `--image` at a stock `debian + xvfb +
+openbox` image, your own GUI image, or an OCI ref rather than rebuild the bundled
+`vmette-desktop` image:
 
 ```sh
 vmette desktop start --image tar+file:///path/to/my-gui-rootfs.tar
@@ -173,7 +147,7 @@ vmette desktop screenshot "$SID" --out shot.png
 open shot.png                                # confirm a rendered desktop
 
 vmette desktop exec "$SID" 'xterm &'         # launch an app
-vmette desktop screenshot "$SID" --out shot2.png
+vmette desktop screenshot "$SID" --out shot2.png --settle  # wait for the screen to quiesce first
 
 vmette desktop navigate "$SID" https://example.com   # open a URL (no shell)
 vmette desktop exec-capture "$SID" 'cat /etc/os-release'   # run a command, print its output
@@ -186,16 +160,28 @@ vmette desktop key   "$SID" 'Return'
 vmette desktop scroll "$SID" 640 400 down 3
 vmette desktop cursor "$SID"                 # prints "X Y"
 
+vmette desktop set-clipboard "$SID" 'hello'  # own CLIPBOARD + PRIMARY
+vmette desktop get-clipboard "$SID"          # print the clipboard text
+vmette desktop paste "$SID" 'hello'          # set clipboard, then Ctrl+V
+vmette desktop view "$SID"                    # start a VNC live view, prints vnc://…
+
 vmette desktop stop "$SID"                   # tear it down
 ```
 
 `start` options: `--image REF`, `--size WxH`, `--net`, `--offline`,
-`--ca-certs DIR`, `--kernel PATH`, `--initramfs PATH` (kernel/initramfs default to
-`assets/<arch>/vmlinuz-virt` and `assets/<arch>/initramfs-vmette` when run from the repo).
+`--ca-certs DIR`, `--kernel PATH`, `--initramfs PATH` (kernel/initramfs are
+auto-discovered via `vmette_assets::require_asset` — searching `$VMETTE_ASSETS_DIR`,
+`./assets/<arch>`, then the install prefix — when not given).
 
-`--ca-certs DIR` mounts a host directory of `.crt` / `.pem` enterprise CA
+`screenshot` options: `--out FILE` (required), and `--settle` to wait until the
+screen stops changing before capturing — tunable with `--timeout-ms N` (give up
+after N ms; default 10000) and `--stable-hold-ms N` (how long the screen must
+hold still). Either tuning flag implies `--settle`.
+
+`--ca-certs DIR` mounts a host directory of `.crt` / `.pem` / `.cer` enterprise CA
 certificates at `/mnt/certs`. At desktop boot the guest installs them into the
-system trust store (generically, in the initramfs init) and the desktop image
+system trust store (generically, in the initramfs init) and the desktop startup
+(the injected `vmette-desktop-run.sh`, and the bundled image's entrypoint)
 additionally writes Chromium's managed `CACertificates` policy, so browser
 automation works behind TLS-inspecting proxies without
 `--ignore-certificate-errors`. When `--ca-certs` is omitted it falls back to the
@@ -209,23 +195,24 @@ Global: `--socket PATH` overrides the daemon socket (default
 
 ## Use it (AI agents via MCP)
 
-`vmette-mcp` exposes the desktop tools to any MCP host. They require `vmetted`
-to be running; the MCP server connects to its socket. Override the socket with
-`--socket PATH`.
+`vmette-mcp` exposes the desktop tools to any MCP host. They route through
+`vmetted`, which the MCP server auto-spawns on first desktop access (override the
+socket with `--socket PATH`).
 
 | Tool | Input | Returns |
 |------|-------|---------|
 | `desktop_start` | `image?`, `size?`, `network?`, `ca_certs?` | session id (text) |
+| `desktop_view` | `session_id` | `vnc://host:port` loopback address for a VNC client (see [Live view](#live-view-watch--drive-the-desktop)) |
 | `desktop_screenshot` | `session_id` | a **framebuffer note** (`framebuffer WxH; …`) **plus a PNG image content block** |
-| `desktop_screenshot_when_settled` | `session_id`, `timeout_ms?` | note + framebuffer note + **PNG image content block** (once the screen stops changing) |
-| `desktop_what_changed` | `session_id` | a note describing the changed region since the last capture + framebuffer note **plus a PNG image content block** of the fresh frame |
+| `desktop_screenshot_when_settled` | `session_id`, `timeout_ms?` (default 10000) | note + framebuffer note + **PNG image content block** (once the screen stops changing) |
+| `desktop_what_changed` | `session_id` | a note describing the changed region since the last capture + framebuffer note **plus a PNG image content block** of the changed region — a crop, so the framebuffer note reflects the crop's pixel size, not the display size (the full frame is returned only when nothing changed) |
 | `desktop_cursor_position` | `session_id` | `"x y"` |
 | `desktop_move` | `session_id`, `x`, `y` | status text (echoes where the pointer landed; flags `(constrained)`) |
 | `desktop_click` | `session_id`, `x`, `y` | status text (echoes the click position) |
 | `desktop_double_click` | `session_id`, `x`, `y` | status text (echoes the click position) |
 | `desktop_right_click` | `session_id`, `x`, `y` | status text (echoes the click position) |
 | `desktop_middle_click` | `session_id`, `x`, `y` | status text (echoes the click position) |
-| `desktop_drag` | `session_id`, `x`, `y` | status text (presses the left button, moves to `(x, y)`, releases — the drag starts at the current pointer position) |
+| `desktop_drag` | `session_id`, `x`, `y` | status text (presses the left button, moves to `(x, y)`, releases — the drag starts at the **current** pointer position, so precede it with `desktop_move` to set the origin; contrast the CLI's all-in-one `drag FX FY TX TY`) |
 | `desktop_type` | `session_id`, `text` | status text |
 | `desktop_key` | `session_id`, `keys` | status text |
 | `desktop_get_clipboard` | `session_id` | the clipboard text, exact (empty if unset — click the content to focus it before `ctrl+a`/`ctrl+c`, or the copy grabs nothing) |
@@ -234,8 +221,8 @@ to be running; the MCP server connects to its socket. Override the socket with
 | `desktop_scroll` | `session_id`, `x`, `y`, `direction`, `amount` | status text |
 | `desktop_exec` | `session_id`, `command` | status text (fire-and-forget) |
 | `desktop_exec_capture` | `session_id`, `command`, `timeout_ms?` | the command's combined stdout/stderr + exit code (runs to completion) |
-| `desktop_navigate` | `session_id`, `url` | status text — opens `url` in the browser with no shell and no synthetic keystrokes |
-| `desktop_launch` | `session_id`, `command`, `wait_ms?` | **PNG image content block** (the app's first painted frame) |
+| `desktop_navigate` | `session_id`, `url` | status text — opens `url` (a URL or a local file path) in the browser with no shell and no synthetic keystrokes |
+| `desktop_launch` | `session_id`, `command`, `wait_ms?` | status note + framebuffer note + **PNG image content block** (the app's first settled frame) |
 | `desktop_stop` | `session_id` | status text |
 
 `desktop_screenshot` returns an MCP image content block
@@ -244,45 +231,35 @@ Alongside the image it returns a **framebuffer note** (`framebuffer WxH; …
 origin top-left`): pointer/click coordinates are in that exact pixel space, so an
 agent reasoning over a downscaled rendering can map its target back to true
 coordinates instead of guessing the scale. `desktop_click` /
-`desktop_double_click` / `desktop_right_click` move the pointer to `(x, y)`
-first, then click (agent click actions fire at the current pointer position).
-Pointer actions (`desktop_move`/click/scroll/drag) **echo where the pointer
-actually landed** in their status text — if a window manager constrained the
-move, the reply reads `… landed at X Y (constrained)`, so a missed target is
-observable in one round-trip instead of requiring a follow-up screenshot.
+`desktop_double_click` / `desktop_right_click` / `desktop_middle_click` move the
+pointer to `(x, y)` first, then click (agent click actions fire at the current
+pointer position).
+`desktop_move` and the click tools **echo where the pointer actually landed**
+in their status text — if a window manager constrained the move, the reply reads
+`… landed at X Y (constrained)`, so a missed target is observable in one
+round-trip instead of requiring a follow-up screenshot. `desktop_scroll` returns
+a fixed `scrolled` and `desktop_drag` a fixed `dragged to X Y` (the requested
+target), neither echoing the landed position.
 `network=true` on `desktop_start` is subject to the server's `--allow-network`
 gate.
 
-**Starting an app and seeing it: `desktop_launch`.** `desktop_exec` is
-fire-and-forget — it launches a command and returns immediately, leaving you to
-poll for the window. `desktop_launch` is the one-call alternative: it
-backgrounds the command (redirecting its stdio to a guest log so a chatty app
-can't block before painting), waits for the screen to actually change and then
-settle, and returns that frame. It is **application-agnostic** — it knows
-nothing about browsers. You pass a complete command and supply whatever flags
-the app needs; e.g. `command: "chromium https://example.com"`,
-`"gimp /mnt/a.png"`, or `"xterm"`. The app-specific incantation a headless
-software-rendered guest requires (for the browser: `--no-sandbox`, software GL)
-lives in the **desktop image**, not in this tool — see below — so a bare
-`chromium <url>` renders. Network-dependent apps only reach the network when the
-session was started with `network=true`.
+**`desktop_launch`** is the one-call alternative to the fire-and-forget
+`desktop_exec`: it backgrounds the command (redirecting its stdio to a guest log
+so a chatty app can't block before painting), waits for the screen to change and
+settle, and returns that frame. It is **application-agnostic** — you pass a
+complete command and any flags the app needs (`"chromium https://example.com"`,
+`"gimp /mnt/a.png"`, `"xterm"`); the headless-guest incantation (for the
+browser: `--no-sandbox`, software GL) lives in the **desktop image**, not the
+tool, so a bare `chromium <url>` renders.
 
-**Navigating a browser: `desktop_navigate`.** Rather than focusing the address
-bar and typing (which races omnibox autocomplete and focus), `desktop_navigate`
-hands the URL straight to the browser's launcher with **no shell and no
-synthetic keystrokes**, so the URL is never word-split or interpreted. It is
-fire-and-forget — it returns once navigation starts, so follow it with
-`desktop_screenshot_when_settled` to wait for the page to paint. The desktop
-image ships a browser-agnostic `vmette-open` launcher, so a custom image can
-swap browsers without touching the agent.
+**`desktop_navigate`** is fire-and-forget — it returns once navigation *starts*,
+so follow it with `desktop_screenshot_when_settled` to wait for the page to
+paint.
 
-**Reading a command's output: `desktop_exec_capture`.** Unlike the
-fire-and-forget `desktop_exec`, this runs a short command to completion and
-returns its combined stdout/stderr plus exit code — for reading a file or
-probing state inside a desktop session without OCR'ing a screenshot. The
-in-guest agent is single-threaded, so it blocks other desktop actions until the
-command returns or hits its (bounded) timeout; keep it to short, terminating
-commands and use `desktop_exec` / `desktop_launch` to start GUI apps.
+**`desktop_exec_capture`** runs the command to completion; the session serializes
+desktop actions, so a long capture delays the next request until it returns or
+hits its timeout. Keep it to short, terminating commands and use `desktop_exec` /
+`desktop_launch` for GUI apps.
 
 ## Protocol
 
@@ -297,7 +274,8 @@ One request object per connection; one reply object back.
   "image": "tar+file:///abs/assets/aarch64/vmette-desktop-rootfs.tar", // required; client-resolved
   "size": "1280x800",                                          // optional
   "net": false, "offline": false,
-  "shares": [{"tag":"certs", "path":"/abs/company-cas"}] } // optional
+  "vcpus": 2, "mem_mib": 2048,                                  // optional; omitted by both clients (CLI and MCP) → daemon defaults (2 vCPU / 2048 MiB)
+  "shares": [{"tag":"certs", "path":"/abs/company-cas"}] } // optional (example is non-exhaustive)
 // ← { "kind": "session", "session_id": "a1b2c3..." }
 
 // → one action
@@ -320,10 +298,13 @@ Errors come back as `{ "kind": "error", "message": "..." }`.
 Between the host `Session` and the in-guest agent the wire format is binary:
 
 ```text
-[u32 LE header_len][header JSON][optional binary payload]
+[u32 LE req_id][u32 LE header_len][header JSON][optional binary payload]
 ```
 
-The request header is an `Action`; the response header is a `ResponseHeader`
+The host assigns a monotonically increasing `req_id` per request that the guest
+echoes verbatim in the matching response frame, so the host demultiplexes
+responses back to the right waiting caller. The request header is an `Action`;
+the response header is a `ResponseHeader`
 (`ok`, `error?`, `x?`, `y?`, `payload_len`). `x`/`y` carry the pointer position:
 `cursor_position` reports it, and every pointer action echoes the *resulting*
 position. Screenshots travel as a raw PNG payload after the header (its pixel
@@ -333,7 +314,9 @@ dimensions are the coordinate space for all pointer actions). See
 ## Action reference
 
 Actions mirror the Anthropic computer-use tool so the MCP layer maps 1:1.
-JSON shape is `{"action": "<name>", ...fields}`.
+JSON shape is `{"action": "<name>", ...fields}`. This is the raw vsock Action
+vocabulary — a superset of what the CLI and MCP expose, so a row here (e.g.
+`wait`) need not have a matching `desktop` subcommand or `desktop_*` tool.
 
 | Action | Fields | Effect |
 |--------|--------|--------|
@@ -347,11 +330,13 @@ JSON shape is `{"action": "<name>", ...fields}`.
 | `left_click_drag` | `x`, `y` | Press, drag to `(x, y)` with **interpolated motion** (so drag-and-drop targets recognize the gesture), release. Header echoes the resulting `(x, y)`. |
 | `type` | `text` | Type a UTF-8 string via synthetic key events. |
 | `key` | `keys` | Press a chord, e.g. `"ctrl+c"`, `"Return"`, `"alt+Tab"`. |
-| `scroll` | `x`, `y`, `direction`, `amount` | Scroll `amount` clicks (`up`/`down`/`left`/`right`). |
+| `scroll` | `x`, `y`, `direction`, `amount` | Scroll `amount` clicks (`up`/`down`/`left`/`right`) at `(x, y)`. Header echoes the resulting `(x, y)`. |
 | `set_clipboard` | `text` | Own the `CLIPBOARD` + `PRIMARY` selections with `text`. |
 | `get_clipboard` | — | Read clipboard text; returned as the response payload (UTF-8). |
 | `wait` | `ms` | Sleep guest-side to let the UI settle. |
-| `exec` | `command` | Launch a shell command (e.g. `"chromium &"`). |
+| `exec` | `command` | Launch a shell command (e.g. `"chromium &"`); fire-and-forget. |
+| `exec_capture` | `command`, `timeout_ms?` | Run `command` (via `/bin/sh -c`) to completion **synchronously**; returns combined stdout/stderr as the payload (UTF-8) and the exit status in the header's `exit_code` (absent ⇒ killed by the timeout guard or a signal). Blocks every other action until it returns. |
+| `navigate` | `url` | Hand `url` to the browser's `vmette-open` launcher with **no shell** (never word-split or interpreted). Fire-and-forget: returns once the launcher spawns, not when the page loads. |
 
 ## Live view (watch / drive the desktop)
 
@@ -360,10 +345,12 @@ A running session can be watched — and optionally driven — by a human over
 live view and returns a loopback address:
 
 ```text
-desktop_view { "session_id": "…" }  →  vnc://127.0.0.1:5901
+desktop_view { "session_id": "…" }  →  vnc://127.0.0.1:<ephemeral>
 ```
 
-Open it with any VNC client — on macOS, `open vnc://127.0.0.1:5901` launches
+The port is an ephemeral loopback port assigned per session (`5901` here is
+illustrative). Open the returned address with any VNC client — on macOS,
+`open vnc://127.0.0.1:5901` launches
 Screen Sharing; [TigerVNC](https://tigervnc.org/) and other standard viewers
 work too.
 
@@ -399,10 +386,7 @@ Properties:
   testing; not for video / WebGL / 3D.
 - **Slower boot than headless** — several seconds for the desktop image + Xvfb
   + WM + first app, versus ~1 s for a headless one-shot.
-- **Memory:** each session is a live VM holding a browser; budget 1–2 GB RAM
-  and ≥2 vCPUs per session. The daemon caps concurrent sessions.
-- **Idle eviction:** sessions untouched for 30 minutes are force-stopped.
+- **Memory:** each session is a live GUI VM — **2 GB RAM (2048 MiB) and 2
+  vCPUs** by default. The daemon caps concurrent sessions.
 - **Arch:** the desktop image and agent must match vmette's guest assets
   (`aarch64` on Apple Silicon, `x86_64` on Intel).
-- **Live view is loopback-only and ~5 fps** (see [Live view](#live-view-watch--drive-the-desktop)):
-  enough to watch and drive the agent, not a video feed.

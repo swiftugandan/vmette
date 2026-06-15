@@ -9,9 +9,7 @@ directly, use the [MCP server](MCP.md); for one-off commands, the [CLI](CLI.md).
 the same protocol:
 
 - **Stateless runs** — one guest run per connection, booted **in-process**
-  via a capture-aware `vmette::Session` (the schema below). A warm-snapshot
-  pool to replace the per-request cold boot is a planned future optimization
-  (Apple Silicon); it is not yet implemented.
+  via a capture-aware `vmette::Session` (the schema below).
 - **Stateful desktop sessions** — `desktop_*` requests that drive a
   persistent in-process VM held across connections (see
   [Desktop session requests](#desktop-session-requests)).
@@ -21,6 +19,8 @@ the same protocol:
 ```sh
 vmetted                                      # default socket
 vmetted --socket /tmp/vmette.sock            # override path
+vmetted --version                            # print version (also -V)
+vmetted --help                               # usage (also -h)
 ```
 
 Default socket: `$HOME/Library/Caches/vmette/vmette.sock`.
@@ -32,8 +32,9 @@ Logs are structured JSON on stderr (tracing-subscriber). Filter with
 RUST_LOG=vmetted=debug vmetted
 ```
 
-`SIGTERM` / `SIGINT` drains in-flight connections and removes the
-socket file before exit.
+`SIGTERM` / `SIGINT` stops accepting new connections, tears down any live
+desktop sessions, and removes the socket file before exit. (In-flight stateless
+runs are not gracefully drained — they are dropped on exit.)
 
 ## Protocol
 
@@ -41,18 +42,28 @@ Line-delimited JSON. One request per connection.
 
 ### Request
 
+Only `kernel`, `initramfs`, `rootfs`, and `exec` are required:
+
 ```json
 {
   "kernel": "/abs/path/vmlinuz-virt",
   "initramfs": "/abs/path/initramfs-vmette",
   "rootfs": "/abs/path/alpine-rootfs",
+  "exec": "echo hi; exit 17"
+}
+```
+
+Every other field is optional and shown below with its default; omit any you
+don't need (the daemon owns the one true default — see the prose after):
+
+```json
+{
   "rootfs_ro": false,
   "offline": false,
   "shares": [
     { "tag": "host", "path": "/abs/path/host_dir" }
   ],
   "disks": [ "/abs/path/disk.img" ],
-  "exec": "echo hi; exit 17",
   "net": false,
   "switch_root": false,
   "vsock_port": 0,
@@ -70,31 +81,29 @@ Line-delimited JSON. One request per connection.
 `tar+file://…`, `squashfs+file://…`). See
 [`CLI.md`](CLI.md#rootfs-providers) for the shipped providers.
 
-`rootfs_ro`, `offline`, `shares`, `disks`, `timeout_seconds`, `net`,
-`switch_root` are optional. `vsock_port` is `-1` (disable) / `0`
-(auto) / `>0` (fixed), defaulting to `0`. `vcpus` defaults to 1,
-`mem_mib` to 512. `scratch_mib` (MiB) attaches an ephemeral ext4 scratch
-disk as the writable overlay upper (the CLI's `--scratch`); omit or `null`
-for the RAM-backed tmpfs overlay.
+`vsock_port` is tri-state: `-1` (disable) / `0` (auto) / `>0` (fixed).
+`scratch_mib` (MiB) attaches an ephemeral ext4 scratch disk as the writable
+overlay upper (the CLI's `--scratch`); omit or `null` for the RAM-backed tmpfs
+overlay.
 
-The daemon run schema has no `env` field — the CLI's `--env KEY=VALUE`
-(and `Config.env`) is not yet wired through `vmetted`. A daemon client
-that needs guest env vars must bake them into the `exec` command itself
+The daemon run schema has no `env` field (the CLI's `--env` / `Config.env` is
+not yet wired through `vmetted`); bake env vars into `exec` instead
 (e.g. `exec: "FOO=bar mycmd"`).
 
 ### Response stream
 
-Newline-delimited JSON frames. Three kinds:
+Newline-delimited JSON frames. The run lane captures the guest's combined
+output on one clean console and streams it as `stdout` frames, terminated by a
+single `exit` (or `error` on a daemon-side failure):
 
 ```json
 {"kind":"stdout","data":"hello world\n"}
-{"kind":"stderr","data":"[vmette] guest stopped (exit 17)\r\n"}
 {"kind":"exit","code":17}
+{"kind":"error","message":"…"}
 ```
 
-`stdout` carries the guest's process stdout, `stderr` carries vmette's
-banner + delegate messages + guest stderr. The final frame is always
-`exit` (or `error` on a daemon-side failure).
+A fourth kind, `stderr`, exists in the protocol for compatibility but is never
+emitted by this lane (guest stderr is folded into `stdout`).
 
 ### Client examples
 
@@ -153,25 +162,14 @@ Each request is still one JSON object per connection, tagged by `kind`:
 
 | `kind` | Key fields | Reply |
 |--------|-----------|-------|
-| `desktop_start` | `kernel`, `initramfs`, `image` (resolved client-side; required), `size?` (`"WxH"`), `net?`, `offline?`, `vcpus?`, `mem_mib?` | `{"kind":"session","session_id":"…"}` |
-| `desktop_action` | `session_id`, `action` (a `vmette::Action`, e.g. `{"action":"screenshot"}`, mouse/key/type/scroll/exec) | `{"kind":"action_result","ok":true,"error?":"…","x?":…,"y?":…,"png_base64?":"…","text?":"…"}` (`text` carries the clipboard for `get_clipboard`) |
-| `desktop_screenshot_settled` | `session_id`, `timeout_ms?` (default 10000), `stable_hold_ms?` (confirmation hold; small default, larger for launches) | `{"kind":"settled","settled":bool,"moving":[…],"png_base64":"…"}` |
-| `desktop_what_changed` | `session_id` | `{"kind":"changed","changed?":{"x":…,"y":…,"w":…,"h":…},"png_base64":"…"}` (`changed` absent when nothing moved) |
+| `desktop_start` | `kernel`, `initramfs`, `image` (resolved client-side; required), `size?` (`"WxH"`; omitted → 1280x800), `net?`, `offline?`, `shares?` (`[{tag,path}]`, mounted at `/mnt/<tag>`), `vcpus?` (default 2), `mem_mib?` (default 2048) | `{"kind":"session","session_id":"…"}` |
+| `desktop_action` | `session_id`, `action` (a `vmette::Action`, e.g. `{"action":"screenshot"}`, mouse/key/type/scroll, `exec_capture`, `get_clipboard`) | `{"kind":"action_result","ok":true,"error?":"…","x?":…,"y?":…,"png_base64?":"…","text?":"…","exit_code?":…}`. `text?` carries the clipboard (`get_clipboard`) or combined stdout/stderr (`exec_capture`); `exit_code?` carries the `exec_capture` status (absent if it didn't exit cleanly, e.g. a timeout). See [`DESKTOP.md`](DESKTOP.md). |
+| `desktop_screenshot_settled` | `session_id`, `timeout_ms?` (default 10000), `stable_hold_ms?` (confirmation hold; daemon default 500 ms) | `{"kind":"settled","settled":bool,"moving":[…],"png_base64":"…"}` |
+| `desktop_what_changed` | `session_id` | `{"kind":"changed","changed?":{"x":…,"y":…,"w":…,"h":…},"png_base64":"…"}` (`changed` absent when nothing moved; `png_base64` is the cropped changed region, or the full frame when nothing changed or the crop is degenerate) |
 | `desktop_view` | `session_id` | `{"kind":"view","addr":"127.0.0.1:PORT"}` — opens (or returns) a live VNC view on a per-session loopback port; idempotent. See [`DESKTOP.md`](DESKTOP.md#live-view-watch--drive-the-desktop). |
 | `desktop_stop` | `session_id` | `{"kind":"stopped"}` |
 
 A daemon-side failure on any kind returns `{"kind":"error","message":"…"}`.
-
-## Today vs the warm-pool roadmap
-
-The stateless run path today boots a fresh microVM in-process per request
-(full cold boot). A warm-snapshot pool is a planned optimization, not
-yet shipped (aarch64 only, since snapshot/restore is Apple-Silicon-only):
-
-| Feature | Today | Warm-pool roadmap (aarch64 only) |
-|---------|-------|----------------------------------|
-| Per-request cost | ~1 s (full cold boot) | ~50 ms (snapshot resume) |
-| Implementation | in-process `Session` per request | in-process warm-snapshot pool |
 
 ## When to use vmetted vs vmette
 
@@ -181,4 +179,3 @@ yet shipped (aarch64 only, since snapshot/restore is Apple-Silicon-only):
 | Many short-lived invocations from a long-lived process | `vmetted` |
 | Persistent desktop / computer-use sessions | `vmetted` (`desktop_*`) |
 | Library embedding from Rust/C | link `libvmette` directly |
-| Future warm-VM pool (aarch64) | `vmetted` (roadmap) |
